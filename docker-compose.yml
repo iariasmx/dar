@@ -1,0 +1,27 @@
+services:
+  mysql-db:
+    image: mysql:8.4
+    container_name: dbingenieria-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: Opl3.5t3eg
+      MYSQL_DATABASE: dbIngenieria
+      MYSQL_USER: dbingenieria_user
+      MYSQL_PASSWORD: dbingenieria_pass
+      TZ: America/Mexico_City
+    ports:
+      - "3306:3306"
+    volumes:
+      - dbingenieria_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pOpl3.5t3eg"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  dbingenieria_data:
