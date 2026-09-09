@@ -3,6 +3,7 @@
 import mysql.connector
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine
 
 from config import db_config
 
@@ -99,8 +100,17 @@ def evaluar_semaforo_slot(modelo, sesiones):
 
 @st.cache_data(ttl=300, show_spinner='Consultando sesiones Infinitum…')
 def cargar_sesiones():
-    conexion = mysql.connector.connect(**db_config)
+    # 1. Construimos la URL de conexión a partir de tu db_config
+    url_conexion = (
+        f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}"
+        f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['database']}"
+    )
+
     try:
+        # 2. Creamos el motor compatible con Pandas
+        engine = create_engine(url_conexion)
+
+        # 3. Ejecutamos pasándole el 'engine' en lugar de 'conexion'
         return pd.read_sql(
             """
             SELECT ID, HOSTNAME, TIPO, SLOT, MAX_USER_SESSION
@@ -109,10 +119,13 @@ def cargar_sesiones():
               AND TRIM(SLOT) != ''
               AND SLOT NOT LIKE '%.%'
             """,
-            conexion,
+            engine,
         )
-    finally:
-        conexion.close()
+    except Exception as e:
+        # Añadido por seguridad para capturar errores de base de datos
+        import streamlit as st
+        st.error(f"❌ Error al cargar sesiones desde MySQL: {e}")
+        return pd.DataFrame()
 
 
 def preparar_sesiones(datos):

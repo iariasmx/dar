@@ -2,10 +2,17 @@ import streamlit as st
 import mysql.connector
 import pandas as pd
 import io
+from sqlalchemy import create_engine, text
 
 from config import db_config
 from graficas import mostrar_top_modelos
 from sesiones import mostrar_sesiones
+from siru_vs_red import generar_matriz_conectividad
+
+url_conexion = (
+    f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}"
+    f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['database']}"
+)
 
 # Configuración de la página de Streamlit
 st.set_page_config(
@@ -21,7 +28,7 @@ st.logo(
 )
 
 
-# Función optimizada con caché para leer todos los datos maestros de SIRU_DSL
+# Función optimizada con caché para leer todos los datos de SIRU_DSL
 @st.cache_data
 def cargar_datos_siru():
     query = """
@@ -43,6 +50,7 @@ def cargar_datos_siru():
                    SLOT, \
                    SUBSLOT, \
                    PUERTO, \
+                   PUERTO_GENERADO, \
                    TIPO_ASIG,
                    PISO, \
                    SALA, \
@@ -57,32 +65,38 @@ def cargar_datos_siru():
             """
     conexion = None
     try:
-        conexion = mysql.connector.connect(**db_config)
-        # Compatibilidad con bases creadas antes de incorporar POS_REMATE.
-        with conexion.cursor() as cursor:
-            cursor.execute("SHOW COLUMNS FROM SIRU_DSL")
-            columnas = {fila[0].upper() for fila in cursor.fetchall()}
+        # 1. Creamos el motor de conexión compatible con Pandas
+        engine = create_engine(url_conexion)
+
+        # 2. Validamos la columna usando una conexión explícita de SQLAlchemy
+        with engine.connect() as conn:
+            result = conn.execute(text("SHOW COLUMNS FROM SIRU_DSL"))
+            columnas = {fila[0].upper() for fila in result.fetchall()}
+
+        # Compatibilidad con bases creadas antes de incorporar POS_REMATE
         if 'POS_REMATE' not in columnas:
             query = query.replace('POS_REMATE,', 'NULL AS POS_REMATE,')
-        df = pd.read_sql(query, conexion)
+
+        # 3. Ejecutamos pd.read_sql usando el 'engine' en lugar del driver crudo
+        df = pd.read_sql(query, engine)
         return df
+
     except Exception as e:
         st.error(f"❌ Error al conectar o consultar MySQL (SIRU_DSL): {e}")
         return pd.DataFrame()
-    finally:
-        if conexion is not None:
-            conexion.close()
 
 
 # Cargar detalles de interfaces L1
 @st.cache_data
 def cargar_datos_interfaces():
     query = """
-            SELECT SLOT, \
+            SELECT ID_INTERFACE, \
+                   ID_EQUIPO, \
+                   SLOT, \
                    SHUTDOWN, \
                    DESCRIPCION as DESC_L1, \
                    ANCHO_BANDA, \
-                   PROTOCOLO,
+                   PROTOCOLO, \
                    TIPO, \
                    IP_ADDRESS, \
                    STATUS      as STATUS_L1, \
@@ -93,18 +107,36 @@ def cargar_datos_interfaces():
             FROM EQUIPOS_DSL_INTERFACE_L1;
             """
     try:
-        conexion = mysql.connector.connect(**db_config)
-        df = pd.read_sql(query, conexion)
-        conexion.close()
+        # Creamos el motor de conexión compatible con Pandas
+        engine = create_engine(url_conexion)
+
+        # Ejecutamos pd.read_sql usando la tabla correcta EQUIPOS_DSL_INTERFACE_L1
+        df = pd.read_sql(query, engine)
+        return df
+
+    except Exception as e:
+        st.error(f"❌ Error al conectar o consultar MySQL (EQUIPOS_DSL_INTERFACE_L1): {e}")
+        return pd.DataFrame()
+
+
+# Nueva función para leer la tabla de equipos DSL desde MySQL
+@st.cache_data
+def cargar_datos_equipos_dsl():
+    query = "SELECT * FROM EQUIPOS_DSL;"
+    try:
+        # Reutilizamos la URL de conexión que ya tienes definida en tu app.py
+        engine = create_engine(url_conexion)
+        df = pd.read_sql(query, engine)
         return df
     except Exception as e:
-        st.error(f"❌ Error al consultar EQUIPOS_DSL_INTERFACE_L1: {e}")
+        st.error(f"❌ Error al conectar o consultar MySQL (EQUIPOS_DSL): {e}")
         return pd.DataFrame()
 
 
 # Cargar DataFrames base globales
 df_siru = cargar_datos_siru()
 df_interfaces = cargar_datos_interfaces()
+df_equipos_dsl = cargar_datos_equipos_dsl()
 
 if df_siru.empty:
     st.warning("⚠️ No se encontraron datos o la conexión a la base de datos falló.")
@@ -256,8 +288,9 @@ buscar_ip_vlan = st.sidebar.text_input("Ingresa Dirección IP o ID de VLAN:", ""
 # =====================================================================
 # 5. RENDERIZADO DE LAS PESTAÑAS (TABS) CON FILTRADO APLICADO
 # =====================================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "⚙️ Números de Parte de Hardware",
+    "⚙️ Distribución de tarjetas",
     "🔌 Capacidad y Estado de Puertos",
     "🌐 Interfaces",
     "📍 Ubicación de equipos",
@@ -322,7 +355,7 @@ def mostrar_detalle_puertos(detalle, estado):
             "PATCH_PANEL": "PP",
             "POS_REMATE": "Posición de remate"
         },
-        width="stretch",
+        width="content",
         hide_index=True,
     )
 
@@ -344,7 +377,7 @@ with tab1:
         "SUBSLOT",
         "MODELO_SUBTARJETA",
     ]
-    st.dataframe(df_tab1[cols_t1], use_container_width=True, hide_index=True)
+    st.dataframe(df_tab1[cols_t1], width="content", hide_index=True)
 
     col_g1, col_g2 = st.columns(2)
     with col_g1:
@@ -364,13 +397,40 @@ with tab1:
             key="app_top_subtarjetas",
         )
 
-# --- PESTAÑA 2: CAPACIDAD ---
+# --- PESTAÑA 2: DISTRIBUCION ---
 with tab2:
+    st.subheader("Distribución de tarjetas por equipo")
+    try:
+        with open("resumen_hardware.py", "r", encoding="utf-8") as file:
+            codigo_resumen = file.read()
+
+            # 🚀 SOLUCIÓN: Pasamos los módulos Y las variables de los filtros activos en tiempo real
+            contexto_global_sincronizado = {
+                "st": st,
+                "pd": pd,
+                "mysql": mysql,
+                "__name__": "__main__",
+                # Inyectamos dinámicamente los valores seleccionados en app.py:
+                "divisional_seleccionada": divisional_seleccionada,
+                "sitio_seleccionado": sitio_seleccionado,
+                "modelo_seleccionado": modelo_seleccionado,
+                "equipo_seleccionado": equipo_seleccionado
+            }
+
+            exec(codigo_resumen, contexto_global_sincronizado)
+
+    except FileNotFoundError:
+        st.error("❌ No se encontró el archivo 'resumen_hardware.py' en el directorio del proyecto.")
+    except Exception as e:
+        st.error(f"💥 Error al ejecutar el módulo de resumen: {e}")
+
+# --- PESTAÑA 3: CAPACIDAD ---
+with tab3:
     st.subheader("Análisis de Disponibilidad y Saturación de Puertos")
-    df_tab2 = filtrar_dataframe(resumen_puertos_equipo)
-    p_ocupados = df_tab2["Puertos_Ocupados"].sum()
-    p_libres = df_tab2["Puertos_Libres"].sum()
-    p_reservados = df_tab2["Puertos_Reservados"].sum()
+    df_tab3 = filtrar_dataframe(resumen_puertos_equipo)
+    p_ocupados = df_tab3["Puertos_Ocupados"].sum()
+    p_libres = df_tab3["Puertos_Libres"].sum()
+    p_reservados = df_tab3["Puertos_Reservados"].sum()
 
     kpi1, kpi2, kpi3 = st.columns(3)
     kpi1.metric("🔴 Puertos Ocupados (Filtro)", f"{p_ocupados:,}")
@@ -391,13 +451,13 @@ with tab2:
             claves_capacidad = ['DIVISIONAL', 'SITIO_UNINET', 'NOMBRE_EQUIPO', 'MODELO_EQUIPO']
             detalle = df_puertos_validos[
                 df_puertos_validos[indicador] == 1
-            ].merge(df_tab2[claves_capacidad], on=claves_capacidad, how='inner', validate='many_to_one')
+            ].merge(df_tab3[claves_capacidad], on=claves_capacidad, how='inner', validate='many_to_one')
             mostrar_detalle_puertos(detalle, estado)
 
     st.markdown("---")
     st.markdown("Detalle de Capacidad por Chasis")
     st.dataframe(
-        df_tab2[
+        df_tab3[
             [
                 "DIVISIONAL",
                 "SITIO_UNINET",
@@ -418,12 +478,12 @@ with tab2:
                 max_value=100.0,
             )
         },
-        use_container_width=True,
+        width="content",
         hide_index=True,
     )
 
-# --- PESTAÑA 3: CAPA INTERFACES L1 ---
-with tab3:
+# --- PESTAÑA 4: CAPA INTERFACES L1 ---
+with tab4:
     st.subheader("Auditoría de Enlaces e Interfaces L1")
     if df_interfaces.empty:
         st.info("ℹ️ No hay datos disponibles para Interfaces L1.")
@@ -431,32 +491,32 @@ with tab3:
         # Relacionar L1 mediante los Slots activos obtenidos de la selección SIRU
         df_siru_f = filtrar_dataframe(df_siru)
         slots_activos = df_siru_f["SLOT"].unique().tolist()
-        df_tab3 = df_interfaces[df_interfaces["SLOT"].isin(slots_activos)].copy()
+        df_tab4 = df_interfaces[df_interfaces["SLOT"].isin(slots_activos)].copy()
 
         if buscar_ip_vlan:
-            df_tab3 = df_tab3[
+            df_tab4 = df_tab4[
                 (
-                    df_tab3["IP_ADDRESS"].str.contains(
+                    df_tab4["IP_ADDRESS"].str.contains(
                         buscar_ip_vlan, case=False
                     )
                 )
-                | (df_tab3["VLAN"].str.contains(buscar_ip_vlan, case=False))
+                | (df_tab4["VLAN"].str.contains(buscar_ip_vlan, case=False))
             ]
 
         c1, c2, c3 = st.columns(3)
         c1.metric(
             "🟢 Interfaces Activas (Up)",
-            f"{len(df_tab3[df_tab3['SHUTDOWN'] == 0]):,}",
+            f"{len(df_tab4[df_tab4['SHUTDOWN'] == 0]):,}",
         )
         c2.metric(
             "🛑 En Shutdown (Administrativo)",
-            f"{len(df_tab3[df_tab3['SHUTDOWN'] == 1]):,}",
+            f"{len(df_tab4[df_tab4['SHUTDOWN'] == 1]):,}",
         )
-        c3.metric("🔑 VLANs Únicas en Uso", f"{df_tab3['VLAN'].nunique():,}")
+        c3.metric("🔑 VLANs Únicas en Uso", f"{df_tab4['VLAN'].nunique():,}")
 
         st.markdown("---")
         st.dataframe(
-            df_tab3[
+            df_tab4[
                 [
                     "SLOT",
                     "STATUS_L1",
@@ -472,14 +532,14 @@ with tab3:
             column_config={
                 "SHUTDOWN": st.column_config.CheckboxColumn("Shutdown")
             },
-            use_container_width=True,
+            width="content",
             hide_index=True,
         )
 
-# --- PESTAÑA 4: INFRAESTRUCTURA Y LOCALIZACIÓN ---
-with tab4:
+# --- PESTAÑA 5: INFRAESTRUCTURA Y LOCALIZACIÓN ---
+with tab5:
     st.subheader("📍 Localización en sitio")
-    df_tab4 = filtrar_dataframe(df_ubicacion_equipos)
+    df_tab5 = filtrar_dataframe(df_ubicacion_equipos)
     cols_t4 = [
         "DIVISIONAL",
         "SITIO_UNINET",
@@ -490,73 +550,26 @@ with tab4:
         "FUNCIONALIDAD",
         "LICENCIA",
     ]
-    st.dataframe(df_tab4[cols_t4], use_container_width=True, hide_index=True)
+    st.dataframe(df_tab5[cols_t4], width="content", hide_index=True)
 
-# --- PESTAÑA 5: CONCILIACIÓN DE TABLAS (CRUCE DIRECTO) ---
-with tab5:
-    st.subheader("🔄 Diagnóstico Cruzado de Integridad Operativa")
-    st.markdown(
-        "Análisis automático cruzando las asignaciones lógicas de "
-        "SIRU_DSL y estados de capa física de INTERFACE_L1 indexados por Slot."
-    )
-    df_tab5 = filtrar_dataframe(df_conciliacion_maestra)
-
-    # Vinculamos esta vista al botón global de descarga
-    df_para_descargar = df_tab5.copy()
-
-    alertas_totales = len(
-        df_tab5[df_tab5["Discrepancia"] != "✅ Operación Alineada"]
-    )
-    promedio_trafico = (
-        df_tab5["TRAFICO_95"].astype(float).mean()
-        if "TRAFICO_95" in df_tab5.columns
-        else 0
-    )
-
-    k_c1, k_c2, k_c3 = st.columns(3)
-    k_c1.metric(
-        "🚨 Discrepancias Detectadas",
-        f"{alertas_totales}",
-        delta="- Estable" if alertas_totales == 0 else "Acción Requerida",
-    )
-    k_c2.metric(
-        "📈 Tráfico Promedio (95th Percentile)",
-        f"{promedio_trafico:.2f} Mbps"
-        if pd.notna(promedio_trafico)
-        else "0.00 Mbps",
-    )
-    k_c3.metric(
-        "🔗 Enlaces con Métrica OK",
-        f"{len(df_tab5[df_tab5['OK_MET'] == 'SI'])} de {len(df_tab5)}",
-    )
-
-    st.markdown("---")
-    cols_cruzadas = [
-        "NOMBRE_EQUIPO",
-        "SLOT",
-        "Discrepancia",
-        "Puertos_Asignados",
-        "Puertos_Libres_Siru",
-        "STATUS_L1",
-        "SHUTDOWN",
-        "IP_ADDRESS",
-        "ANCHO_BANDA",
-        "TRAFICO_95",
-    ]
-    st.dataframe(
-        df_tab5[cols_cruzadas],
-        column_config={
-            "Discrepancia": st.column_config.TextColumn(
-                "Análisis de Consistencia", width="large"
-            ),
-            "SHUTDOWN": st.column_config.CheckboxColumn("Shutdown"),
-            "TRAFICO_95": st.column_config.NumberColumn("Tráfico (Mbps)"),
-        },
-        use_container_width=True,
-        hide_index=True,
-    )
-
+# --- PESTAÑA 6: CONCILIACIÓN DE TABLAS (CRUCE DIRECTO) ---
 with tab6:
+    # st.subheader("🔄 Diagnóstico Cruzado de Integridad Operativa")
+    # st.markdown(
+    #     "Análisis automático cruzando las asignaciones lógicas de "
+    #     "SIRU_DSL y estados de capa física de INTERFACE_L1 indexados por Slot."
+    # )
+    generar_matriz_conectividad(
+        df_siru=df_siru,
+        df_equipos=df_equipos_dsl,
+        df_interfaces=df_interfaces,
+        divisional=divisional_seleccionada,
+        sitio=sitio_seleccionado,
+        modelo=modelo_seleccionado,
+        equipo=equipo_seleccionado
+    )
+
+with tab7:
     equipos_sesiones = filtrar_dataframe(df_siru)[[
         'NOMBRE_EQUIPO',
         'MODELO_EQUIPO',

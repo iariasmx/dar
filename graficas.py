@@ -50,4 +50,4 @@ def mostrar_top_modelos(conteos, *, key):
             margin=dict(l=10, r=20, t=20, b=40),
         ),
     )
-    st.plotly_chart(figura, use_container_width=True, key=key, theme='streamlit')
+    st.plotly_chart(figura, width="content", key=key, theme='streamlit')

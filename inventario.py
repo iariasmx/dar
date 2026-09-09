@@ -17,19 +17,18 @@ st.set_page_config(
 @st.cache_data
 def cargar_datos_siru():
     query = """
-        SELECT 
-            SITIO_UNINET,
-            NOMBRE_EQUIPO,
-            MODELO as MODELO_EQUIPO,
-            SLOT,
-            NUM_PARTE_TARJETA,
-            SUBSLOT,
-            NUM_PARTE_SUBTARJETA,
-            STATUS_EQUIPO
-        FROM SIRU_DSL
-        WHERE NOMBRE_EQUIPO IS NOT NULL 
-          AND STATUS_EQUIPO != 'BAJA';
-    """
+            SELECT SITIO_UNINET, \
+                   NOMBRE_EQUIPO, \
+                   MODELO as MODELO_EQUIPO, \
+                   SLOT, \
+                   NUM_PARTE_TARJETA, \
+                   SUBSLOT, \
+                   NUM_PARTE_SUBTARJETA, \
+                   STATUS_EQUIPO
+            FROM SIRU_DSL
+            WHERE NOMBRE_EQUIPO IS NOT NULL
+              AND STATUS_EQUIPO != 'BAJA'; \
+            """
     try:
         conexion = mysql.connector.connect(**db_config)
         df = pd.read_sql(query, conexion)
@@ -38,6 +37,7 @@ def cargar_datos_siru():
     except Exception as e:
         st.error(f"❌ Error al conectar o consultar MySQL: {e}")
         return pd.DataFrame()
+
 
 # Cargar el DataFrame base
 df_siru = cargar_datos_siru()
@@ -94,7 +94,6 @@ inventario_hardware.rename(columns={
 inventario_hardware['MODELO_SUBTARJETA'] = inventario_hardware['MODELO_SUBTARJETA'].fillna('N/A')
 inventario_hardware['SUBSLOT'] = inventario_hardware['SUBSLOT'].fillna('N/A')
 inventario_hardware['Cantidad_Subtarjeta'] = inventario_hardware['Cantidad_Subtarjeta'].fillna(0).astype(int)
-
 
 # =====================================================================
 # INTERFAZ GRÁFICA INTERACTIVA (STREAMLIT)
@@ -154,28 +153,50 @@ if modelo_seleccionado != "TODOS":
 if equipo_seleccionado != "TODOS":
     df_dashboard = df_dashboard[df_dashboard['NOMBRE_EQUIPO'] == equipo_seleccionado]
 
-
 # Despliegue de los Resultados Filtrados
-st.subheader("🗂️ Matriz de Inventario y Números de Parte de Hardware")
-st.markdown(f"Mostrando **{len(df_dashboard)}** configuraciones de ranura según los filtros seleccionados.")
+st.subheader("🗂️ Matrices de Análisis de Hardware")
 
-# Columnas optimizadas para mostrar en la interfaz web de manera limpia
-columnas_vista = [
-    'SITIO_UNINET',
-    'NOMBRE_EQUIPO',
-    'MODELO_EQUIPO',
-    'SLOT',
-    'MODELO_TARJETA',
-    'SUBSLOT',
-    'MODELO_SUBTARJETA'
-]
+col_tabla1, col_tabla2 = st.columns([0.55, 0.45])
 
-# Tabla principal interactiva
-st.dataframe(
-    df_dashboard[columnas_vista],
-    use_container_width=True,
-    hide_index=True
-)
+with col_tabla1:
+    st.markdown("**1. Detalle General por Ranura / Slot**")
+    columnas_vista = [
+        'SITIO_UNINET', 'NOMBRE_EQUIPO', 'MODELO_EQUIPO',
+        'SLOT', 'MODELO_TARJETA', 'SUBSLOT', 'MODELO_SUBTARJETA'
+    ]
+    st.dataframe(
+        df_dashboard[columnas_vista],
+        use_container_width=True,
+        hide_index=True
+    )
+
+with col_tabla2:
+    st.markdown("**2. Resumen de Números de Parte Únicos por Slot**")
+
+    # 🚀 CORRECCIÓN AQUÍ:
+    # Primero colapsamos el dataframe para quedarnos solo con Tarjetas Únicas (borrando la inflación de subtarjetas)
+    df_tarjetas_unicas = df_dashboard.drop_duplicates(
+        subset=['NOMBRE_EQUIPO', 'SLOT', 'MODELO_TARJETA']
+    )
+
+    # Ahora sí, la agrupación contará TARJETAS físicas reales
+    df_agrupado_slots = df_tarjetas_unicas.groupby(
+        ['MODELO_TARJETA', 'SLOT']
+    ).size().reset_index(name='Total Instalado')
+
+    # Ordenar de forma limpia
+    df_agrupado_slots = df_agrupado_slots.sort_values(by=['MODELO_TARJETA', 'SLOT'])
+
+    st.dataframe(
+        df_agrupado_slots,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "MODELO_TARJETA": "Número de Parte (Tarjeta)",
+            "SLOT": "Slot",
+            "Total Instalado": "Cantidad de Tarjetas Físicas"
+        }
+    )
 
 # Sección Secundaria: Distribución de Hardware Común
 st.divider()
