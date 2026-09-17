@@ -100,17 +100,14 @@ def evaluar_semaforo_slot(modelo, sesiones):
 
 @st.cache_data(ttl=300, show_spinner='Consultando sesiones Infinitum…')
 def cargar_sesiones():
-    # 1. Construimos la URL de conexión a partir de tu db_config
     url_conexion = (
         f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}"
         f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['database']}"
     )
 
     try:
-        # 2. Creamos el motor compatible con Pandas
         engine = create_engine(url_conexion)
-
-        # 3. Ejecutamos pasándole el 'engine' en lugar de 'conexion'
+        # REGLA OBLIGATORIA: Filtrar desde MySQL para omitir sub-interfaces lógicas con punto
         return pd.read_sql(
             """
             SELECT ID, HOSTNAME, TIPO, SLOT, MAX_USER_SESSION
@@ -122,7 +119,6 @@ def cargar_sesiones():
             engine,
         )
     except Exception as e:
-        # Añadido por seguridad para capturar errores de base de datos
         import streamlit as st
         st.error(f"❌ Error al cargar sesiones desde MySQL: {e}")
         return pd.DataFrame()
@@ -133,12 +129,27 @@ def preparar_sesiones(datos):
     for campo in ('HOSTNAME', 'TIPO', 'SLOT'):
         datos[campo] = datos[campo].fillna('').astype(str).str.strip()
     datos['SLOT'] = datos['SLOT'].str.lstrip("'")
+
+    # REGLA OBLIGATORIA: Doble validación en Pandas para descartar cualquier fila con punto '.'
     datos = datos[datos['SLOT'].ne('') & ~datos['SLOT'].str.contains('.', regex=False)].copy()
+
     texto = datos['MAX_USER_SESSION'].fillna('').astype(str).str.strip()
-    # No convertir valores inválidos a cero: se reportan como datos pendientes.
     datos['SESIONES'] = pd.to_numeric(texto.where(texto.str.fullmatch(r'[0-9]+')), errors='coerce')
     return datos
 
+
+def preparar_sesiones(datos):
+    datos = datos.copy()
+    for campo in ('HOSTNAME', 'TIPO', 'SLOT'):
+        datos[campo] = datos[campo].fillna('').astype(str).str.strip()
+    datos['SLOT'] = datos['SLOT'].str.lstrip("'")
+
+    # MODIFICACIÓN: Ya no eliminamos las filas con punto '.' aquí
+    datos = datos[datos['SLOT'].ne('')].copy()
+
+    texto = datos['MAX_USER_SESSION'].fillna('').astype(str).str.strip()
+    datos['SESIONES'] = pd.to_numeric(texto.where(texto.str.fullmatch(r'[0-9]+')), errors='coerce')
+    return datos
 
 def filtrar_sesiones_por_equipos(datos, equipos):
     """Relaciona nombres cortos de SIRU con hostnames que incluyen dominio."""
@@ -215,6 +226,7 @@ def mostrar_sesiones(equipos):
         cargar_sesiones.clear()
 
     try:
+        # 1. Cargar y preparar datos (excluyendo sub-interfaces con punto)
         datos = preparar_sesiones(cargar_sesiones())
 
         if isinstance(equipos, pd.DataFrame):
@@ -245,134 +257,183 @@ def mostrar_sesiones(equipos):
     )
 
     if tipo is not None:
-        datos = datos[datos['TIPO'] == tipo]
+        datos = datos[datos['TIPO'] == tipo].copy()
 
-    invalidos = datos['SESIONES'].isna().sum()
-    if invalidos:
-        st.warning(f'{invalidos:,} registros tienen MAX_USER_SESSION vacío o inválido y no se suman.')
+    if datos.empty:
+        st.info('No hay sesiones para el tipo de interfaz seleccionado.')
+        return
 
-    if datos.duplicated(['HOSTNAME', 'TIPO', 'SLOT'], keep=False).any():
-        st.warning('Hay interfaces repetidas por hostname, tipo y slot. Se suman todas sus filas; revisar la carga de origen.')
+    # --- 1. EXTRACCIÓN INMEDIATA Y SEGURA DE SLOT Y SUBSLOT ---
+    def extraer_identificadores(row):
+        slot_completo = str(row['SLOT']).strip().lstrip("'")
+        modelo = str(row['MODELO_EQUIPO']).upper()
 
-    validos = datos.dropna(subset=['SESIONES'])
+        # Quitar sub-interfaces lógicas si existen
+        slot_sin_subinterfaz = slot_completo.split('.')[0]
+        partes = slot_sin_subinterfaz.split('/')
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric(
-        'Total de sesiones por equipo',
-        f"{int(validos['SESIONES'].sum()):,}" if not validos.empty else 'Sin datos válidos',
-    )
-    c2.metric('Equipos', f"{datos.loc[datos['HOSTNAME'].ne(''), 'HOSTNAME'].nunique():,}")
-    c3.metric('Interfaces', f"{len(datos.drop_duplicates(['HOSTNAME', 'TIPO', 'SLOT'])):,}")
+        import re
 
-    detalle = datos[['HOSTNAME', 'HOSTNAME_CORTO', 'MODELO_EQUIPO', 'TIPO', 'SLOT', 'SESIONES']].copy()
-    # detalle['MODELO_NORMALIZADO'] = detalle['MODELO_EQUIPO'].apply(normalizar_modelo)
+        slot_principal = 0
+        subslot = "0"
 
-    resumen_caja = detalle.groupby(
-        ['HOSTNAME', 'MODELO_EQUIPO'],
-        dropna=False,
-    )['SESIONES'].sum(min_count=1).reset_index()
+        # Regla Cisco ASR / NAUCALPAN (rack/slot/module/port)
+        if any(x in modelo for x in ('CISCO', 'ASR', '9010', '480', '960')) or 'NAUCALPAN' in str(
+                row['HOSTNAME']).upper():
+            # Extraer Slot (Índice 1)
+            if len(partes) >= 2:
+                match_slot = re.search(r'\d+', partes[1])
+                if match_slot:
+                    slot_principal = int(match_slot.group(0))
 
-    reglas_caja = resumen_caja['MODELO_EQUIPO'].apply(regla_caja_por_modelo)
+            # Extraer Subslot combinando modulo/tarjeta (ej. de '0/0/1/2' extrae '0/1')
+            if len(partes) >= 4:
+                m_mod = re.search(r'\d+', partes[1])
+                m_sub = re.search(r'\d+', partes[2])
+                mod_val = m_mod.group(0) if m_mod else "0"
+                sub_val = m_sub.group(0) if m_sub else "0"
+                subslot = f"{mod_val}/{sub_val}"
+            elif len(partes) == 3:
+                m_mod = re.search(r'\d+', partes[1])
+                subslot = m_mod.group(0) if m_mod else "0"
 
-    resumen_caja['CAPACIDAD_CAJA'] = reglas_caja.apply(lambda regla: regla['capacidad']).astype(int)
-    resumen_caja['UMBRAL_CAJA_75'] = reglas_caja.apply(lambda regla: regla['umbral_75']).astype(int)
-    # resumen_caja['LEYENDA_UMBRAL_CAJA'] = reglas_caja.apply(lambda regla: regla['leyenda'])
+        # Regla Juniper / Default (slot/subslot/port)
+        else:
+            # Extraer Slot (Índice 0)
+            if partes and len(partes) > 0:
+                match_slot = re.search(r'\d+', partes[0])
+                if match_slot:
+                    slot_principal = int(match_slot.group(0))
 
-    resumen_caja['%_USO_CAJA'] = (
-        resumen_caja['SESIONES'] / resumen_caja['CAPACIDAD_CAJA'] * 100
-    ).round(1)
+            # Extraer Subslot (Índice 1)
+            if len(partes) >= 2:
+                match_sub = re.search(r'\d+', partes[1])
+                if match_sub:
+                    subslot = match_sub.group(0)
 
-    resumen_caja['SEMAFORO_CAJA'] = resumen_caja.apply(
-        lambda fila: calcular_semaforo(fila['SESIONES'], fila['CAPACIDAD_CAJA']),
-        axis=1,
-    )
+        return pd.Series([slot_principal, subslot])
 
-    resumen_slot = detalle.groupby(
-        ['HOSTNAME', 'MODELO_EQUIPO', 'TIPO', 'SLOT'],
-        dropna=False,
-    )['SESIONES'].sum(min_count=1).reset_index()
+    # Aplicamos la extracción al dataframe original
+    datos[['SLOT_PRINCIPAL', 'SUBSLOT']] = datos.apply(extraer_identificadores, axis=1)
 
-    reglas_slot = resumen_slot['MODELO_EQUIPO'].apply(regla_slot_por_modelo)
+    # --- 2. CREACIÓN DE PESTAÑAS (TABS) PARA CADA VISTA ---
+    tab_slot, tab_subslot = st.tabs(['Visualización por Slot', 'Visualización por Subslot'])
 
-    resumen_slot['CAPACIDAD_SLOT'] = reglas_slot.apply(lambda regla: regla['capacidad']).astype(int)
-    resumen_slot['UMBRAL_SLOT_75'] = reglas_slot.apply(lambda regla: regla['umbral_75']).astype(int)
-    # resumen_slot['LEYENDA_UMBRAL_SLOT'] = reglas_slot.apply(lambda regla: regla['leyenda'])
+    # ==================== VISTA 1: POR SLOT ====================
+    with tab_slot:
+        datos_agrupados_slot = datos.groupby(
+            ['HOSTNAME', 'MODELO_EQUIPO', 'TIPO', 'SLOT_PRINCIPAL'],
+            as_index=False
+        ).agg({'SESIONES': 'sum'})
 
-    resumen_slot['%_USO_SLOT'] = (
-        resumen_slot['SESIONES'] / resumen_slot['CAPACIDAD_SLOT'] * 100
-    ).round(1)
+        datos_agrupados_slot = datos_agrupados_slot.rename(columns={'SLOT_PRINCIPAL': 'SLOT'})
+        datos_agrupados_slot = datos_agrupados_slot.sort_values(by=['HOSTNAME', 'SLOT', 'TIPO'],
+                                                                ascending=[True, True, True])
 
-    resumen_slot['SEMAFORO_SLOT'] = resumen_slot.apply(
-        lambda fila: calcular_semaforo(fila['SESIONES'], fila['CAPACIDAD_SLOT']),
-        axis=1,
-    )
+        datos_agrupados_slot['CAPACIDAD_SLOT'] = datos_agrupados_slot['MODELO_EQUIPO'].apply(capacidad_slot_por_modelo)
+        datos_agrupados_slot['UMBRAL_75'] = datos_agrupados_slot['MODELO_EQUIPO'].apply(
+            lambda mod: regla_slot_por_modelo(mod)['umbral_75'])
+        datos_agrupados_slot['USO_SLOT_PCT'] = (
+                    datos_agrupados_slot['SESIONES'] / datos_agrupados_slot['CAPACIDAD_SLOT'] * 100).fillna(0)
+        datos_agrupados_slot['USO_SLOT_PCT_VISUAL'] = datos_agrupados_slot['USO_SLOT_PCT'].clip(upper=100.0)
+        datos_agrupados_slot['SEMÁFORO_SLOT'] = datos_agrupados_slot.apply(
+            lambda r: evaluar_semaforo_slot(r['MODELO_EQUIPO'], r['SESIONES']), axis=1)
 
-    st.markdown('**Semáforo por caja**')
-    st.dataframe(
-        resumen_caja,
-        hide_index=True,
-        width='stretch',
-        column_config={
-            'SESIONES': st.column_config.NumberColumn('Sesiones por equipo', format='%d'),
-            'CAPACIDAD_CAJA': st.column_config.NumberColumn('Capacidad caja', format='%d'),
-            'UMBRAL_CAJA_75': st.column_config.NumberColumn('Umbral caja 75%', format='%d'),
-            # 'LEYENDA_UMBRAL_CAJA': st.column_config.TextColumn('Regla aplicada a caja'),
-            '%_USO_CAJA': st.column_config.ProgressColumn(
-                'Uso caja',
-                format='%.1f%%',
-                min_value=0.0,
-                max_value=100.0,
-            ),
-            'SEMAFORO_CAJA': st.column_config.TextColumn('Semáforo caja'),
-        },
-    )
+        # Métricas de Slot
+        v_slot = datos_agrupados_slot.dropna(subset=['SESIONES'])
+        t_sesiones_slot = int(v_slot['SESIONES'].sum()) if not v_slot.empty else 0
+        t_slots_físicos = len(datos_agrupados_slot['SLOT'].unique())
 
-    st.markdown('**Semáforo por slot**')
-    st.dataframe(
-        resumen_slot,
-        hide_index=True,
-        width='stretch',
-        column_config={
-            'SESIONES': st.column_config.NumberColumn('Sesiones por slot', format='%d'),
-            'CAPACIDAD_SLOT': st.column_config.NumberColumn('Capacidad slot', format='%d'),
-            'UMBRAL_SLOT_75': st.column_config.NumberColumn('Umbral slot 75%', format='%d'),
-            # 'LEYENDA_UMBRAL_SLOT': st.column_config.TextColumn('Regla aplicada al slot'),
-            '%_USO_SLOT': st.column_config.ProgressColumn(
-                'Uso slot',
-                format='%.1f%%',
-                min_value=0.0,
-                max_value=100.0,
-            ),
-            'SEMAFORO_SLOT': st.column_config.TextColumn('Semáforo slot'),
-        },
-    )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Slots Físicos", f"{t_slots_físicos:,}")
+        c2.metric("Total Sesiones", f"{t_sesiones_slot:,}")
+        sat_slot = (datos_agrupados_slot['SEMÁFORO_SLOT'] == '🔴 Saturado').sum()
+        pct_sat_slot = (sat_slot / len(datos_agrupados_slot) * 100) if len(datos_agrupados_slot) > 0 else 0
+        c3.metric("Líneas Saturadas (🔴)", f"{pct_sat_slot:.1f}%")
 
-    with st.expander('Ver detalle por interfaz'):
+        st.write("### Semáforo por slot")
         st.dataframe(
-            detalle,
-            hide_index=True,
-            width='stretch',
+            datos_agrupados_slot[
+                ['HOSTNAME', 'MODELO_EQUIPO', 'TIPO', 'SLOT', 'SESIONES', 'CAPACIDAD_SLOT', 'UMBRAL_75',
+                 'USO_SLOT_PCT_VISUAL', 'SEMÁFORO_SLOT']],
             column_config={
-                'SESIONES': st.column_config.NumberColumn('Sesiones totales', format='%d'),
+                "SLOT": st.column_config.NumberColumn("SLOT", format="%d"),
+                "SESIONES": st.column_config.NumberColumn("Sesiones por tipo/slot", format="%d"),
+                "USO_SLOT_PCT_VISUAL": st.column_config.ProgressColumn("Uso slot", format="%.1f%%", min_value=0,
+                                                                       max_value=100),
             },
+            use_container_width=True, hide_index=True
         )
 
-    col_descarga1, col_descarga2 = st.columns(2)
+        # ==================== VISTA 2: POR SUBSLOT ====================
+        with tab_subslot:
+            # Agrupamos incluyendo la columna 'SUBSLOT'
+            datos_agrupados_sub = datos.groupby(
+                ['HOSTNAME', 'MODELO_EQUIPO', 'TIPO', 'SLOT_PRINCIPAL', 'SUBSLOT'],
+                as_index=False
+            ).agg({'SESIONES': 'sum'})
 
-    with col_descarga1:
-        st.download_button(
-            'Descargar sesiones por caja',
-            resumen_caja.to_csv(index=False).encode('utf-8'),
-            file_name='sesiones_infinitum_por_caja.csv',
-            mime='text/csv',
-            key='descargar_sesiones_caja',
-        )
+            datos_agrupados_sub = datos_agrupados_sub.rename(columns={'SLOT_PRINCIPAL': 'SLOT'})
+            datos_agrupados_sub = datos_agrupados_sub.sort_values(by=['HOSTNAME', 'SLOT', 'SUBSLOT', 'TIPO'],
+                                                                  ascending=[True, True, True, True])
 
-    with col_descarga2:
-        st.download_button(
-            'Descargar sesiones por slot',
-            resumen_slot.to_csv(index=False).encode('utf-8'),
-            file_name='sesiones_infinitum_por_slot.csv',
-            mime='text/csv',
-            key='descargar_sesiones_slot',
-        )
+            # --- REGLA SOLICITADA: UMBRALES Y CAPACIDAD FIJOS DE 32,000 PARA SUBSLOT ---
+            datos_agrupados_sub['CAPACIDAD_SUBSLOT'] = 32000
+
+            # El umbral al 75% de 32,000 es exactamente 24,000
+            datos_agrupados_sub['UMBRAL_75'] = int(32000 * 0.75)
+
+            # Calcular el porcentaje de uso real sobre los 32,000
+            datos_agrupados_sub['USO_SUBSLOT_PCT'] = (
+                        datos_agrupados_sub['SESIONES'] / datos_agrupados_sub['CAPACIDAD_SUBSLOT'] * 100).fillna(0)
+            datos_agrupados_sub['USO_SUBSLOT_PCT_VISUAL'] = datos_agrupados_sub['USO_SUBSLOT_PCT'].clip(upper=100.0)
+
+            # Evaluar el semáforo usando la capacidad fija de 32,000
+            datos_agrupados_sub['SEMÁFORO_SUBSLOT'] = datos_agrupados_sub.apply(
+                lambda r: calcular_semaforo(r['SESIONES'], 32000), axis=1
+            )
+
+            # Métricas de Subslot
+            v_sub = datos_agrupados_sub.dropna(subset=['SESIONES'])
+            t_sesiones_sub = int(v_sub['SESIONES'].sum()) if not v_sub.empty else 0
+            t_subslots = len(datos_agrupados_sub.groupby(['SLOT', 'SUBSLOT']))
+
+            cs1, cs2, cs3 = st.columns(3)
+            cs1.metric("Total Subslots", f"{t_subslots:,}")
+            cs2.metric("Total Sesiones", f"{t_sesiones_sub:,}")
+            sat_sub = (datos_agrupados_sub['SEMÁFORO_SUBSLOT'] == '🔴 Saturado').sum()
+            pct_sat_sub = (sat_sub / len(datos_agrupados_sub) * 100) if len(datos_agrupados_sub) > 0 else 0
+            cs3.metric("Subslots Saturados (🔴)", f"{pct_sat_sub:.1f}%")
+
+            st.write("### Semáforo por subslot")
+            st.dataframe(
+                datos_agrupados_sub[[
+                    'HOSTNAME', 'MODELO_EQUIPO', 'TIPO', 'SLOT', 'SUBSLOT',
+                    'SESIONES', 'CAPACIDAD_SUBSLOT', 'UMBRAL_75', 'USO_SUBSLOT_PCT_VISUAL', 'SEMÁFORO_SUBSLOT'
+                ]],
+                column_config={
+                    "SLOT": st.column_config.NumberColumn("SLOT FÍSICO", format="%d"),
+                    "SUBSLOT": st.column_config.TextColumn("SUBSLOT / MODULO"),
+                    "SESIONES": st.column_config.NumberColumn("Sesiones por subslot", format="%d"),
+                    "CAPACIDAD_SUBSLOT": st.column_config.NumberColumn("Capacidad subslot", format="%d"),
+                    "UMBRAL_75": st.column_config.NumberColumn("Umbral 75%", format="%d"),
+                    "USO_SUBSLOT_PCT_VISUAL": st.column_config.ProgressColumn(
+                        "Uso subslot",
+                        help="Porcentaje consumido del total del subslot (Base 32k)",
+                        format="%.1f%%",
+                        min_value=0,
+                        max_value=100,
+                    ),
+                    "SEMÁFORO_SUBSLOT": "Semáforo subslot"
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+
+
+
+
+
+
+
+

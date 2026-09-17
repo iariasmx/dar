@@ -9,6 +9,8 @@ from graficas import mostrar_top_modelos
 from sesiones import mostrar_sesiones
 from siru_vs_red import generar_matriz_conectividad
 
+pd.set_option("styler.render.max_elements", 5000000)
+
 url_conexion = (
     f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}"
     f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['database']}"
@@ -482,59 +484,204 @@ with tab3:
         hide_index=True,
     )
 
-# --- PESTAÑA 4: CAPA INTERFACES L1 ---
+# --- PESTAÑA 4: CAPA INTERFACES L1 (PRONÓSTICOS) ---
 with tab4:
-    st.subheader("Auditoría de Enlaces e Interfaces L1")
-    if df_interfaces.empty:
-        st.info("ℹ️ No hay datos disponibles para Interfaces L1.")
+    st.subheader("🔮 Análisis Predictivo de Tendencias (Capacidad L1)")
+    st.markdown(
+        "Proyección inteligente de saturación y capacidad de enlaces de red mediante aprendizaje estadístico utilizando **Prophet**.")
+
+    # 1. Validación de los Filtros de la Barra Lateral Jerárquica
+    if equipo_seleccionado == "TODOS":
+        st.warning(
+            "⚠️ Selecciona un **Nombre de Equipo** específico en la barra lateral para inspeccionar sus interfaces y tendencias históricas.")
     else:
-        # Relacionar L1 mediante los Slots activos obtenidos de la selección SIRU
-        df_siru_f = filtrar_dataframe(df_siru)
-        slots_activos = df_siru_f["SLOT"].unique().tolist()
-        df_tab4 = df_interfaces[df_interfaces["SLOT"].isin(slots_activos)].copy()
+        import pronosticos
+        import pandas as pd
 
-        if buscar_ip_vlan:
-            df_tab4 = df_tab4[
-                (
-                    df_tab4["IP_ADDRESS"].str.contains(
-                        buscar_ip_vlan, case=False
-                    )
+        # Inicialización del motor local a partir de tu url_conexion compartida globalmente
+        engine_prophet = create_engine(url_conexion)
+
+        # 2. Extracción dinámica de hostnames basados en el equipo PERCENTIL_HISTORICO actual
+        with st.spinner("Buscando interfaces indexadas en telemetría..."):
+            query_buscar_hosts = """
+                                 SELECT DISTINCT interface_hostname
+                                 FROM PERCENTIL_HISTORICO
+                                 WHERE interface_hostname LIKE %s
+                                    OR interface_hostname = %s
+                                 ORDER BY interface_hostname; \
+                                 """
+            patron_busqueda = f"%{equipo_seleccionado}%"
+            df_hosts_disponibles = pd.read_sql(
+                query_buscar_hosts,
+                engine_prophet,
+                params=(patron_busqueda, equipo_seleccionado)
+            )
+
+        if df_hosts_disponibles.empty:
+            st.error(
+                f"❌ No se localizaron registros de tráfico históricos en `PERCENTIL_HISTORICO` para el equipo **{equipo_seleccionado}**.")
+        else:
+            # 3. Parametrización interactiva local de la pestaña
+            col_l1, col_l2, col_l3 = st.columns(3)
+
+            with col_l1:
+                host_seleccionado = st.selectbox(
+                    "Selecciona la Interfaz / Hostname de Red:",
+                    options=df_hosts_disponibles['interface_hostname'].tolist(),
+                    key="predict_host_l1"
                 )
-                | (df_tab4["VLAN"].str.contains(buscar_ip_vlan, case=False))
-            ]
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric(
-            "🟢 Interfaces Activas (Up)",
-            f"{len(df_tab4[df_tab4['SHUTDOWN'] == 0]):,}",
-        )
-        c2.metric(
-            "🛑 En Shutdown (Administrativo)",
-            f"{len(df_tab4[df_tab4['SHUTDOWN'] == 1]):,}",
-        )
-        c3.metric("🔑 VLANs Únicas en Uso", f"{df_tab4['VLAN'].nunique():,}")
+            with col_l2:
+                # LISTA ACTUALIZADA CON LOS NOMBRES DEL DDL ACTUAL
+                metrica_seleccionada = st.selectbox(
+                    "Métrica de Rendimiento a Evaluar:",
+                    options=[
+                        "95_percentil_out_porcentaje",
+                        "95_percentil_in_porcentaje",
+                        "98_percentil_out_porcentaje",
+                        "98_percentil_in_porcentaje",
+                        "peak_out_porcentaje",
+                        "peak_in_porcentaje"
+                    ],
+                    format_func=lambda x: x.replace("_", " ").title(),
+                    key="predict_metric_l1"
+                )
 
-        st.markdown("---")
-        st.dataframe(
-            df_tab4[
-                [
-                    "SLOT",
-                    "STATUS_L1",
-                    "SHUTDOWN",
-                    "IP_ADDRESS",
-                    "ANCHO_BANDA",
-                    "PROTOCOLO",
-                    "VLAN",
-                    "TRUNK",
-                    "DESC_L1",
-                ]
-            ],
-            column_config={
-                "SHUTDOWN": st.column_config.CheckboxColumn("Shutdown")
-            },
-            width="content",
-            hide_index=True,
-        )
+            with col_l3:
+                horizonte_semanas = st.slider(
+                    "Horizonte del Pronóstico (Semanas):",
+                    min_value=4, max_value=26, value=12,
+                    key="predict_weeks_l1"
+                )
+
+            btn_calcular_tendencia = st.button("🔮 Generar Pronóstico de Tendencia", use_container_width=True,
+                                               type="primary")
+
+            # 4. Inferencia Matemática y Visualización de Resultados
+            if btn_calcular_tendencia:
+                with st.spinner(
+                        f"Analizando comportamiento histórico y entrenando Prophet para {host_seleccionado}..."):
+
+                    # Llamada a la extracción limpia usando la variable local única df_telemetria_l1
+                    df_telemetria_l1 = pronosticos.obtener_y_limpiar_datos(host_seleccionado, metrica_seleccionada,
+                                                                           engine_prophet)
+
+                    if df_telemetria_l1.empty:
+                        st.warning(
+                            f"La interfaz {host_seleccionado} no cuenta con registros de datos válidos para la métrica seleccionada.")
+                    else:
+                        modelo, forecast = pronosticos.generar_prediccion_prophet(df_telemetria_l1, horizonte_semanas)
+
+                        if forecast is None:
+                            st.error(
+                                "⚠️ Datos históricos insuficientes (mínimo 2 semanas con datos en la DB) para poder proyectar una tendencia.")
+                        else:
+                            # Feedback informativo al usuario según la naturaleza de sus datos históricos
+                            if modelo == "CONSTANTE":
+                                st.info(
+                                    "💡 **Nota de Tráfico:** Esta interfaz presenta un comportamiento completamente plano o sin consumo en todo su histórico. El pronóstico se proyecta constante.")
+                            elif len(df_telemetria_l1) < 26:
+                                st.info(
+                                    "📊 **Nota de Precisión:** El histórico disponible es menor a 6 meses. La tendencia proyectada es lineal básica (sin curvas estacionales anuales).")
+                            else:
+                                st.success("¡Modelo predictivo generado con éxito!")
+
+                            # 5. Renderizado de Gráfica Continua
+                            # ======================================================================
+                            # 🔥 NUEVA SECCIÓN: CÁLCULO E INTEGRACIÓN DE KPIS MÉRICOS DIGITALES
+                            # ======================================================================
+                            # Filtramos únicamente los registros del futuro para buscar el peor escenario real
+                            df_solo_futuro = forecast[forecast['ds'] > df_telemetria_l1['ds'].max()]
+
+                            if not df_solo_futuro.empty:
+                                # Localizamos la fila con el pico más alto estimado (Peor Escenario)
+                                fila_pico_max = df_solo_futuro.loc[df_solo_futuro['yhat_upper'].idxmax()]
+
+                                valor_pico_max = fila_pico_max['yhat_upper']
+                                fecha_pico_max = fila_pico_max['ds'].strftime('%Y-%m-%d')
+
+                                # Obtenemos el último valor histórico real como referencia para comparar
+                                ultimo_valor_real = df_telemetria_l1['y'].iloc[-1]
+                                delta_crecimiento = valor_pico_max - ultimo_valor_real
+
+                                # Desplegamos los KPIs en 3 columnas arriba del gráfico
+                                col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
+
+                                with col_kpi1:
+                                    st.metric(
+                                        label="Pico Máximo Estimado",
+                                        value=f"{valor_pico_max:.2f} %",
+                                        delta=f"{delta_crecimiento:+.2f} % vs Último Real",
+                                        delta_color="inverse"  # Rojo si sube, verde si baja (ideal para saturación)
+                                    )
+
+                                with col_kpi2:
+                                    st.metric(
+                                        label="📅 Fecha Estimada del Pico",
+                                        value=fecha_pico_max
+                                    )
+
+                                with col_kpi3:
+                                    # Estado del enlace basado en si el peor escenario cruza el 85%
+                                    estado_enlace = "🚨 SATURACIÓN" if valor_pico_max > 85.0 else "✅ SEGURO"
+                                    st.metric(
+                                        label="Status de Capacidad Futura",
+                                        value=estado_enlace
+                                    )
+                            st.markdown("---")
+                            # ======================================================================
+
+                            # 5. Renderizado de Gráfica Continua (Con Peor Escenario de Picos)
+                            st.subheader("📈 Proyección de Tráfico con Intervalo de Picos Máximos")
+
+                            chart_data = forecast[['ds', 'yhat', 'yhat_upper']].merge(df_telemetria_l1, on='ds',
+                                                                                      how='left')
+                            chart_data.rename(columns={
+                                'y': 'Histórico Real (%)',
+                                'yhat': 'Tendencia Promedio (%)',
+                                'yhat_upper': 'Peor Escenario (Picos Máximos) (%)'
+                            }, inplace=True)
+
+                            chart_data.set_index('ds', inplace=True)
+                            chart_data['Umbral Crítico (85%)'] = 85.0
+
+                            st.line_chart(
+                                chart_data[[
+                                    'Histórico Real (%)',
+                                    'Tendencia Promedio (%)',
+                                    'Peor Escenario (Picos Máximos) (%)',
+                                    'Umbral Crítico (85%)'
+                                ]],
+                                color=["#1f77b4", "#aec7e8", "#ff7f0e", "#d62728"]
+                            )
+
+                            # 6. Matriz Futura de Capacidad con Semáforo de Riesgo (>85%)
+                            st.subheader("📋 Proyección Semanal Futura e Indicadores de Riesgo")
+
+                            df_futuro = forecast[forecast['ds'] > df_telemetria_l1['ds'].max()][
+                                ['ds', 'yhat', 'yhat_upper']].copy()
+                            df_futuro.columns = ['Fecha Proyectada', 'Consumo Promedio Estimado (%)',
+                                                 'Peor Escenario (Saturación Máxima) (%)']
+
+
+                            # Marcado de alerta si el peor escenario matemático roza el umbral crítico
+                            def estilo_alerta_saturacion(val):
+                                if val > 85.0:
+                                    return 'background-color: rgba(235, 74, 91, 0.2); color: #eb4a5b; font-weight: bold;'
+                                else:
+                                    # Formato CSS válido para celdas normales sin alerta
+                                    return 'background-color: transparent;'
+
+
+                            st.dataframe(
+                                df_futuro.style.map(estilo_alerta_saturacion,
+                                                    subset=['Peor Escenario (Saturación Máxima) (%)']).format(
+                                    precision=2),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+                            st.caption(
+                                "💡 Nota: El indicador del **Peor Escenario** calcula el límite superior del intervalo de confianza. Las celdas marcadas señalan semanas de riesgo latente de saturación (>85%).")
 
 # --- PESTAÑA 5: INFRAESTRUCTURA Y LOCALIZACIÓN ---
 with tab5:
