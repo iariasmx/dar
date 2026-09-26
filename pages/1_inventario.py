@@ -1,9 +1,16 @@
-import streamlit as st
-import mysql.connector
-import pandas as pd
+import sys
+from pathlib import Path
 
-from config import db_config
-from graficas import mostrar_top_modelos
+import pandas as pd
+import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from dar.db import conectar_mysql
+from dar.graficas import mostrar_top_modelos
 
 # Configuración de la página de Streamlit (Debe ser la primera instrucción)
 st.set_page_config(
@@ -30,7 +37,7 @@ def cargar_datos_siru():
               AND STATUS_EQUIPO != 'BAJA'; \
             """
     try:
-        conexion = mysql.connector.connect(**db_config)
+        conexion = conectar_mysql()
         df = pd.read_sql(query, conexion)
         conexion.close()
         return df

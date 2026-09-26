@@ -1,0 +1,35 @@
+# Entorno y secretos locales
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE y sistema operativo
+.idea/
+.vscode/
+.DS_Store
+
+# Logs y salidas locales
+*.log
+logs/
+tmp/
+temp/

@@ -1,11 +1,9 @@
 """Consulta y visualización de sesiones Infinitum por interfaz física."""
 
-import mysql.connector
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine
 
-from config import db_config
+from .db import crear_engine_mysql
 
 def normalizar_modelo(modelo):
     return str(modelo or '').upper().replace('-', '').replace('_', '').replace(' ', '')
@@ -100,13 +98,8 @@ def evaluar_semaforo_slot(modelo, sesiones):
 
 @st.cache_data(ttl=300, show_spinner='Consultando sesiones Infinitum…')
 def cargar_sesiones():
-    url_conexion = (
-        f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}"
-        f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['database']}"
-    )
-
     try:
-        engine = create_engine(url_conexion)
+        engine = crear_engine_mysql()
         # REGLA OBLIGATORIA: Filtrar desde MySQL para omitir sub-interfaces lógicas con punto
         return pd.read_sql(
             """
@@ -119,7 +112,6 @@ def cargar_sesiones():
             engine,
         )
     except Exception as e:
-        import streamlit as st
         st.error(f"❌ Error al cargar sesiones desde MySQL: {e}")
         return pd.DataFrame()
 
@@ -132,20 +124,6 @@ def preparar_sesiones(datos):
 
     # REGLA OBLIGATORIA: Doble validación en Pandas para descartar cualquier fila con punto '.'
     datos = datos[datos['SLOT'].ne('') & ~datos['SLOT'].str.contains('.', regex=False)].copy()
-
-    texto = datos['MAX_USER_SESSION'].fillna('').astype(str).str.strip()
-    datos['SESIONES'] = pd.to_numeric(texto.where(texto.str.fullmatch(r'[0-9]+')), errors='coerce')
-    return datos
-
-
-def preparar_sesiones(datos):
-    datos = datos.copy()
-    for campo in ('HOSTNAME', 'TIPO', 'SLOT'):
-        datos[campo] = datos[campo].fillna('').astype(str).str.strip()
-    datos['SLOT'] = datos['SLOT'].str.lstrip("'")
-
-    # MODIFICACIÓN: Ya no eliminamos las filas con punto '.' aquí
-    datos = datos[datos['SLOT'].ne('')].copy()
 
     texto = datos['MAX_USER_SESSION'].fillna('').astype(str).str.strip()
     datos['SESIONES'] = pd.to_numeric(texto.where(texto.str.fullmatch(r'[0-9]+')), errors='coerce')
@@ -429,8 +407,6 @@ def mostrar_sesiones(equipos):
                 use_container_width=True,
                 hide_index=True
             )
-
-
 
 
 

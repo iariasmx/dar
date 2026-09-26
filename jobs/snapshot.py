@@ -1,12 +1,20 @@
+import sys
+from pathlib import Path
+
 import mysql.connector
 
-from config import db_config
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from dar.db import conectar_mysql
 
 conexion = None
 cursor = None
 
 try:
-    conexion = mysql.connector.connect(**db_config)
+    conexion = conectar_mysql()
     cursor = conexion.cursor()
 
     # 1. Leer el estado actual de las interfaces activas

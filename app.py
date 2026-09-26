@@ -1,20 +1,23 @@
-import streamlit as st
-import mysql.connector
-import pandas as pd
 import io
-from sqlalchemy import create_engine, text
+import sys
+from pathlib import Path
 
-from config import db_config
-from graficas import mostrar_top_modelos
-from sesiones import mostrar_sesiones
-from siru_vs_red import generar_matriz_conectividad
+import pandas as pd
+import streamlit as st
+from sqlalchemy import text
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from dar.db import crear_engine_mysql
+from dar.graficas import mostrar_top_modelos
+from dar.resumen_hardware import mostrar_resumen_hardware
+from dar.sesiones import mostrar_sesiones
+from dar.siru_vs_red import generar_matriz_conectividad
 
 pd.set_option("styler.render.max_elements", 5000000)
-
-url_conexion = (
-    f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}"
-    f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['database']}"
-)
 
 # Configuración de la página de Streamlit
 st.set_page_config(
@@ -24,8 +27,8 @@ st.set_page_config(
 )
 
 st.logo(
-    image="logo_uninet.png",       # Logotipo local para barra lateral expandida
-    icon_image="logo_uninet.png",  # Logotipo local si la barra lateral se colapsa
+    image=str(PROJECT_ROOT / "assets" / "logo_uninet.png"),
+    icon_image=str(PROJECT_ROOT / "assets" / "logo_uninet.png"),
     size="large"                   # Dimensión del contenedor web
 )
 
@@ -68,7 +71,7 @@ def cargar_datos_siru():
     conexion = None
     try:
         # 1. Creamos el motor de conexión compatible con Pandas
-        engine = create_engine(url_conexion)
+        engine = crear_engine_mysql()
 
         # 2. Validamos la columna usando una conexión explícita de SQLAlchemy
         with engine.connect() as conn:
@@ -110,7 +113,7 @@ def cargar_datos_interfaces():
             """
     try:
         # Creamos el motor de conexión compatible con Pandas
-        engine = create_engine(url_conexion)
+        engine = crear_engine_mysql()
 
         # Ejecutamos pd.read_sql usando la tabla correcta EQUIPOS_DSL_INTERFACE_L1
         df = pd.read_sql(query, engine)
@@ -126,8 +129,7 @@ def cargar_datos_interfaces():
 def cargar_datos_equipos_dsl():
     query = "SELECT * FROM EQUIPOS_DSL;"
     try:
-        # Reutilizamos la URL de conexión que ya tienes definida en tu app.py
-        engine = create_engine(url_conexion)
+        engine = crear_engine_mysql()
         df = pd.read_sql(query, engine)
         return df
     except Exception as e:
@@ -403,28 +405,14 @@ with tab1:
 with tab2:
     st.subheader("Distribución de tarjetas por equipo")
     try:
-        with open("resumen_hardware.py", "r", encoding="utf-8") as file:
-            codigo_resumen = file.read()
-
-            # 🚀 SOLUCIÓN: Pasamos los módulos Y las variables de los filtros activos en tiempo real
-            contexto_global_sincronizado = {
-                "st": st,
-                "pd": pd,
-                "mysql": mysql,
-                "__name__": "__main__",
-                # Inyectamos dinámicamente los valores seleccionados en app.py:
-                "divisional_seleccionada": divisional_seleccionada,
-                "sitio_seleccionado": sitio_seleccionado,
-                "modelo_seleccionado": modelo_seleccionado,
-                "equipo_seleccionado": equipo_seleccionado
-            }
-
-            exec(codigo_resumen, contexto_global_sincronizado)
-
-    except FileNotFoundError:
-        st.error("❌ No se encontró el archivo 'resumen_hardware.py' en el directorio del proyecto.")
+        mostrar_resumen_hardware(
+            divisional=divisional_seleccionada,
+            sitio=sitio_seleccionado,
+            modelo=modelo_seleccionado,
+            equipo=equipo_seleccionado,
+        )
     except Exception as e:
-        st.error(f"💥 Error al ejecutar el módulo de resumen: {e}")
+        st.error(f"💥 Error al mostrar el resumen: {e}")
 
 # --- PESTAÑA 3: CAPACIDAD ---
 with tab3:
@@ -495,11 +483,10 @@ with tab4:
         st.warning(
             "⚠️ Selecciona un **Nombre de Equipo** específico en la barra lateral para inspeccionar sus interfaces y tendencias históricas.")
     else:
-        import pronosticos
+        from dar import pronosticos
         import pandas as pd
 
-        # Inicialización del motor local a partir de tu url_conexion compartida globalmente
-        engine_prophet = create_engine(url_conexion)
+        engine_prophet = crear_engine_mysql()
 
         # 2. Extracción dinámica de hostnames basados en el equipo PERCENTIL_HISTORICO actual
         with st.spinner("Buscando interfaces indexadas en telemetría..."):

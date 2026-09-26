@@ -9,17 +9,15 @@ El punto de entrada principal es `app.py`. Los dashboards consultan datos existe
 | Archivo | Función |
 | --- | --- |
 | `app.py` | Dashboard principal con inventario, capacidad, interfaces L1, ubicación y conciliación. |
-| `inventario.py` | Dashboard independiente de tarjetas y subtarjetas, con filtros por sitio, modelo de equipo y equipo. |
-| `snapshot.py` | Copia el estado de interfaces activas a la tabla histórica. |
-| `pronosticos.py` | Entrena Prophet para una interfaz y muestra un pronóstico en consola. |
+| `pages/1_inventario.py` | Dashboard independiente de tarjetas y subtarjetas, con filtros por sitio, modelo de equipo y equipo. |
+| `jobs/snapshot.py` | Copia el estado de interfaces activas a la tabla histórica. |
+| `src/dar/pronosticos.py` | Funciones de pronóstico con Prophet usadas por el dashboard. |
 | `main.py` | Plantilla de PyCharm: imprime un saludo; no inicia la aplicación. |
 | `docker-compose.yml` | Servicio MySQL y volumen persistente. No contiene un servicio para Streamlit. |
-| `docker/mysql/init/DatabaseSchemaManagement.sql` | Creación de la base de datos, tablas e índices. |
-| `graficas.py` | Gráficas de barras horizontales con Plotly compartidas por ambos dashboards. |
-| `sesiones.py` | Consulta y pestaña de sesiones Infinitum con filtros propios. |
-| `config.py` | Carga y valida la configuración compartida de MySQL. |
+| `sql/init/DatabaseSchemaManagement.sql` | Creación de la base de datos, tablas e índices. |
+| `src/dar/` | Paquete con conexiones, consultas, gráficas, sesiones, transformaciones y vistas reutilizables. |
 | `.env.example` | Plantilla para crear el archivo local `.env`. |
-| `requirements.txt` | Dependencias de los dashboards y del snapshot; Prophet se instala por separado. |
+| `requirements.txt` | Dependencias de los dashboards y del snapshot, incluido Prophet. |
 
 ## Requisitos e instalación
 
@@ -38,17 +36,11 @@ python -m pip install -r requirements.txt
 
 En Windows, activar el entorno con `.venv\Scripts\activate` desde CMD o `.venv\Scripts\Activate.ps1` desde PowerShell.
 
-Para ejecutar pronósticos, instalar además:
-
-```bash
-python -m pip install prophet
-```
-
 `io` y `re`, utilizados por el código, pertenecen a la biblioteca estándar de Python.
 
 ## Configuración de MySQL
 
-Los cuatro módulos operativos (`app.py`, `inventario.py`, `snapshot.py` y `pronosticos.py`) importan `db_config` desde `config.py`. Este módulo utiliza `python-dotenv` para cargar el archivo `.env` de la raíz del proyecto, independientemente del directorio desde el que se ejecute Python.
+Los puntos de entrada (`app.py`, `pages/1_inventario.py` y `jobs/snapshot.py`) usan el paquete `src/dar`. Su módulo de configuración carga `.env` desde la raíz del proyecto, independientemente del directorio desde el que se ejecute Python.
 
 Si todavía no existe un archivo `.env`, crearlo desde la plantilla:
 
@@ -82,7 +74,7 @@ docker compose logs mysql-db
 
 El servicio `mysql-db` crea el contenedor `dbingenieria-mysql`, publica el puerto `3306`, utiliza la zona horaria `America/Mexico_City` y conserva los datos en el volumen `dbingenieria_data` administrado por Compose. Ajustar el puerto publicado y `DB_PORT` en `.env` si el puerto local ya está ocupado.
 
-El directorio `docker/mysql/init` se monta en `/docker-entrypoint-initdb.d`. MySQL ejecuta sus scripts al inicializar un directorio de datos vacío; reiniciar un volumen existente no vuelve a aplicar el esquema.
+El directorio `sql/init` se monta en `/docker-entrypoint-initdb.d`. MySQL ejecuta sus scripts al inicializar un directorio de datos vacío; reiniciar un volumen existente no vuelve a aplicar el esquema.
 
 Para abrir una sesión SQL y comprobar las tablas, introducir la contraseña configurada cuando se solicite:
 
@@ -108,7 +100,7 @@ docker compose down
 Aplicar el esquema desde la raíz del proyecto, con un usuario que tenga permisos para crear la base de datos y sus tablas:
 
 ```bash
-mysql -h localhost -P 3306 -u root -p < docker/mysql/init/DatabaseSchemaManagement.sql
+mysql -h localhost -P 3306 -u root -p < sql/init/DatabaseSchemaManagement.sql
 ```
 
 El SQL utiliza `CREATE ... IF NOT EXISTS`; no es un sistema de migraciones y no modifica la estructura de tablas ya existentes.
@@ -165,13 +157,13 @@ El botón lateral exporta la conciliación filtrada como `conciliacion_siru_vs_l
 ## Dashboard de inventario independiente
 
 ```bash
-python -m streamlit run inventario.py
+python -m streamlit run pages/1_inventario.py
 ```
 
 Para ejecutarlo junto al dashboard principal:
 
 ```bash
-python -m streamlit run inventario.py --server.port 8502
+python -m streamlit run pages/1_inventario.py --server.port 8502
 ```
 
 Muestra tarjetas y subtarjetas por equipo, slot y subslot. Los filtros por sitio, modelo de equipo y equipo afectan a la tabla; sus indicadores generales y gráficas de los diez modelos predominantes se calculan sobre el inventario completo. Los equipos sin número de parte de tarjeta no forman parte de esa matriz.
@@ -179,7 +171,7 @@ Muestra tarjetas y subtarjetas por equipo, slot y subslot. Los filtros por sitio
 ## Captura de histórico
 
 ```bash
-python snapshot.py
+python jobs/snapshot.py
 ```
 
 Cada ejecución selecciona interfaces cuyo `STATUS = 'UP'` **o** `SHUTDOWN = 0`, e inserta `ID_INTERFACE`, `ID_EQUIPO`, `SLOT`, `ANCHO_BANDA` y `TRAFICO_95` en `HISTORICO_DSL_INTERFACE`. La fecha la asigna MySQL y las inserciones se confirman con `commit`.
@@ -188,25 +180,7 @@ El script escribe en la base de datos. No realiza deduplicación: ejecutarlo var
 
 ## Pronóstico de capacidad
 
-Con datos históricos disponibles y Prophet instalado:
-
-```bash
-python pronosticos.py
-```
-
-Los parámetros se editan directamente en `pronosticos.py`; no hay argumentos de línea de comandos:
-
-| Parámetro | Valor actual | Uso |
-| --- | --- | --- |
-| `ID_A_ANALIZAR` | `545705` | Interfaz que se consulta en el histórico. |
-| `DIAS_A_PREDECIR` | `90` | Número de días futuros. |
-| `UMBRAL_CRITICO` | `85.0` | Umbral de ocupación porcentual. |
-
-El script extrae la primera cifra de `ANCHO_BANDA`, multiplica por 1000 si el texto contiene `gb` y trata los demás valores numéricos como Mbps. Por tanto, otras unidades requieren normalización previa. `TRAFICO_95` debe estar en Mbps para calcular correctamente `tráfico / capacidad × 100`.
-
-Descarta registros sin capacidad o tráfico y capacidades no positivas. Entrena Prophet con estacionalidad semanal habilitada y estacionalidades diaria y anual deshabilitadas. Se necesitan al menos dos observaciones válidas en fechas distintas para el ajuste básico; la utilidad del pronóstico depende de la extensión, frecuencia y calidad del histórico.
-
-La salida en consola informa la primera fecha futura cuya estimación `yhat` alcanza o supera el umbral, o indica que no lo cruza en el horizonte analizado. No guarda resultados, genera gráficas ni envía notificaciones. El resultado es una estimación del modelo, sin evaluación de precisión implementada en el proyecto.
+La pestaña de pronósticos del dashboard principal usa `src/dar/pronosticos.py` y Prophet. Seleccionar un equipo y una interfaz permite preparar la serie histórica, elegir la métrica y generar la proyección desde la interfaz. La utilidad necesita al menos dos observaciones válidas en fechas distintas; su calidad depende de la extensión, frecuencia y limpieza del histórico.
 
 ## Limitaciones y resolución de problemas
 

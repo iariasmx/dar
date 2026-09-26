@@ -42,3 +42,4 @@ urllib3
 uvicorn
 watchdog
 websockets
+prophet
