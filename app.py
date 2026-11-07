@@ -13,8 +13,10 @@ if str(SRC_DIR) not in sys.path:
 
 from dar.db import crear_engine_mysql
 from dar.graficas import mostrar_top_modelos
+from dar.obsolescencia import cargar_catalogo_obsolescencia, detectar_piezas_obsoletas
 from dar.resumen_hardware import mostrar_resumen_hardware
 from dar.sesiones import mostrar_sesiones
+from dar.sesiones import agregar_modelo_equipo, cargar_sesiones, filtrar_sesiones_por_equipos, preparar_sesiones
 from dar.siru_vs_red import generar_matriz_conectividad
 
 pd.set_option("styler.render.max_elements", 5000000)
@@ -91,6 +93,24 @@ def cargar_datos_siru():
         return pd.DataFrame()
 
 
+@st.cache_data
+def cargar_datos_estatus_hardware():
+    """Carga todos los estados de equipo, incluyendo equipos en BAJA."""
+    query = """
+            SELECT DIVISIONAL, SITIO_UNINET, NOMBRE_EQUIPO,
+                   MODELO as MODELO_EQUIPO, STATUS_EQUIPO, CHASIS,
+                   NUM_PARTE_TARJETA, STATUS_TARJETA, SLOT,
+                   NUM_PARTE_SUBTARJETA, STATUS_SUBTARJETA, SUBSLOT
+            FROM SIRU_DSL
+            WHERE NOMBRE_EQUIPO IS NOT NULL;
+            """
+    try:
+        return pd.read_sql(query, crear_engine_mysql())
+    except Exception as e:
+        st.error(f"❌ Error al consultar los estados de hardware en SIRU_DSL: {e}")
+        return pd.DataFrame()
+
+
 # Cargar detalles de interfaces L1
 @st.cache_data
 def cargar_datos_interfaces():
@@ -139,6 +159,7 @@ def cargar_datos_equipos_dsl():
 
 # Cargar DataFrames base globales
 df_siru = cargar_datos_siru()
+df_estatus_hardware_siru = cargar_datos_estatus_hardware()
 df_interfaces = cargar_datos_interfaces()
 df_equipos_dsl = cargar_datos_equipos_dsl()
 
@@ -155,6 +176,57 @@ df_siru['SLOT'] = df_siru['SLOT'].fillna('0').astype(str).str.strip()
 df_siru['SUBSLOT'] = df_siru['SUBSLOT'].fillna('0').astype(str).str.strip()
 df_siru['PUERTO'] = df_siru['PUERTO'].fillna('').str.strip()
 df_siru['TIPO_ASIG'] = df_siru['TIPO_ASIG'].fillna('').str.strip().str.upper()
+
+
+def preparar_estatus_hardware(df):
+    """Normaliza equipo, tarjetas y subtarjetas en una tabla de estatus."""
+    columnas = [
+        'DIVISIONAL', 'SITIO_UNINET', 'NOMBRE_EQUIPO', 'MODELO_EQUIPO',
+        'TIPO_COMPONENTE', 'NUM_PARTE', 'SLOT', 'SUBSLOT', 'ESTATUS',
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=columnas)
+
+    registros = []
+    datos_equipo = df.drop_duplicates(subset=['NOMBRE_EQUIPO'])
+    for _, fila in datos_equipo.iterrows():
+        registros.append({
+            'DIVISIONAL': fila['DIVISIONAL'], 'SITIO_UNINET': fila['SITIO_UNINET'],
+            'NOMBRE_EQUIPO': fila['NOMBRE_EQUIPO'], 'MODELO_EQUIPO': fila['MODELO_EQUIPO'],
+            'TIPO_COMPONENTE': 'Equipo / chasis', 'NUM_PARTE': fila['CHASIS'],
+            'SLOT': '', 'SUBSLOT': '', 'ESTATUS': fila['STATUS_EQUIPO'],
+        })
+
+    tarjetas = df[df['NUM_PARTE_TARJETA'].fillna('').str.strip().ne('')].drop_duplicates(
+        subset=['NOMBRE_EQUIPO', 'SLOT', 'NUM_PARTE_TARJETA']
+    )
+    for _, fila in tarjetas.iterrows():
+        registros.append({
+            'DIVISIONAL': fila['DIVISIONAL'], 'SITIO_UNINET': fila['SITIO_UNINET'],
+            'NOMBRE_EQUIPO': fila['NOMBRE_EQUIPO'], 'MODELO_EQUIPO': fila['MODELO_EQUIPO'],
+            'TIPO_COMPONENTE': 'Tarjeta', 'NUM_PARTE': fila['NUM_PARTE_TARJETA'],
+            'SLOT': fila['SLOT'], 'SUBSLOT': '', 'ESTATUS': fila['STATUS_TARJETA'],
+        })
+
+    subtarjetas = df[df['NUM_PARTE_SUBTARJETA'].fillna('').str.strip().ne('')].drop_duplicates(
+        subset=['NOMBRE_EQUIPO', 'SLOT', 'SUBSLOT', 'NUM_PARTE_SUBTARJETA']
+    )
+    for _, fila in subtarjetas.iterrows():
+        registros.append({
+            'DIVISIONAL': fila['DIVISIONAL'], 'SITIO_UNINET': fila['SITIO_UNINET'],
+            'NOMBRE_EQUIPO': fila['NOMBRE_EQUIPO'], 'MODELO_EQUIPO': fila['MODELO_EQUIPO'],
+            'TIPO_COMPONENTE': 'Subtarjeta', 'NUM_PARTE': fila['NUM_PARTE_SUBTARJETA'],
+            'SLOT': fila['SLOT'], 'SUBSLOT': fila['SUBSLOT'], 'ESTATUS': fila['STATUS_SUBTARJETA'],
+        })
+
+    resultado = pd.DataFrame(registros, columns=columnas)
+    resultado['ESTATUS'] = resultado['ESTATUS'].fillna('').astype(str).str.strip().str.upper()
+    resultado['SLOT'] = resultado['SLOT'].fillna('').astype(str).str.strip()
+    resultado['SUBSLOT'] = resultado['SUBSLOT'].fillna('').astype(str).str.strip()
+    return resultado
+
+
+df_estatus_hardware = preparar_estatus_hardware(df_estatus_hardware_siru)
 
 # Campos de ubicación física
 for col in ['UBICACION']:
@@ -245,11 +317,12 @@ df_conciliacion_maestra['Discrepancia'] = df_conciliacion_maestra.apply(
 # =====================================================================
 # 4. DISPOSITIVOS DE INTERFAZ GRÁFICA (STREAMLIT SIDEBAR)
 # =====================================================================
-st.title("📊 Análisis de Infraestructura y Capacidad (SIRU)")
+st.title("📊 Diseño y Análisis de Red UniNet")
 
 def limpiar_filtros():
-    for clave in ('filtro_divisional', 'filtro_sitio', 'filtro_modelo', 'filtro_equipo'):
+    for clave in ('filtro_divisional', 'filtro_modelo', 'filtro_equipo'):
         st.session_state[clave] = 'TODOS'
+    st.session_state['filtro_sitio'] = []
     st.session_state['filtro_ip_vlan'] = ''
     st.session_state.pop('tipo_asig_ocupados', None)
     st.session_state['sesiones_tipo'] = None
@@ -267,11 +340,18 @@ if divisional_seleccionada != "TODOS":
 else:
     df_filtrado_sitios = df_siru
 
-lista_sitios = ["TODOS"] + sorted(df_filtrado_sitios['SITIO_UNINET'].unique().tolist())
-sitio_seleccionado = st.sidebar.selectbox("Selecciona Sitio Uninet:", lista_sitios, key="filtro_sitio")
+if not isinstance(st.session_state.get('filtro_sitio'), list):
+    st.session_state['filtro_sitio'] = []
+lista_sitios = sorted(df_filtrado_sitios['SITIO_UNINET'].dropna().unique().tolist())
+sitio_seleccionado = st.sidebar.multiselect(
+    "Selecciona Sitio Uninet:",
+    lista_sitios,
+    key="filtro_sitio",
+    placeholder="Todos los sitios",
+)
 
-if sitio_seleccionado != "TODOS":
-    df_filtrado_equipos = df_filtrado_sitios[df_filtrado_sitios['SITIO_UNINET'] == sitio_seleccionado]
+if sitio_seleccionado:
+    df_filtrado_equipos = df_filtrado_sitios[df_filtrado_sitios['SITIO_UNINET'].isin(sitio_seleccionado)]
 else:
     df_filtrado_equipos = df_filtrado_sitios
 
@@ -292,14 +372,17 @@ buscar_ip_vlan = st.sidebar.text_input("Ingresa Dirección IP o ID de VLAN:", ""
 # =====================================================================
 # 5. RENDERIZADO DE LAS PESTAÑAS (TABS) CON FILTRADO APLICADO
 # =====================================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab_resumen, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    "📌 Resumen ejecutivo",
     "⚙️ Números de Parte de Hardware",
     "⚙️ Distribución de tarjetas",
     "🔌 Capacidad y Estado de Puertos",
     "🌐 Interfaces",
     "📍 Ubicación de equipos",
     "🔄 Conciliación (SIRU vs Red)",
-    "👥 Sesiones Infinitum"
+    "👥 Sesiones Infinitum",
+    "⚠️ Obsolescencia y reemplazos",
+    "🚦 Estatus de hardware",
 ])
 
 
@@ -308,8 +391,8 @@ def filtrar_dataframe(df_target, campo_div='DIVISIONAL', campo_sit='SITIO_UNINET
     df_res = df_target.copy()
     if divisional_seleccionada != "TODOS" and campo_div in df_res.columns:
         df_res = df_res[df_res[campo_div] == divisional_seleccionada]
-    if sitio_seleccionado != "TODOS" and campo_sit in df_res.columns:
-        df_res = df_res[df_res[campo_sit] == sitio_seleccionado]
+    if sitio_seleccionado and campo_sit in df_res.columns:
+        df_res = df_res[df_res[campo_sit].isin(sitio_seleccionado)]
     if modelo_seleccionado != "TODOS" and 'MODELO_EQUIPO' in df_res.columns:
         df_res = df_res[df_res['MODELO_EQUIPO'] == modelo_seleccionado]
     if equipo_seleccionado != "TODOS" and campo_eq in df_res.columns:
@@ -366,6 +449,304 @@ def mostrar_detalle_puertos(detalle, estado):
 
 # Dataframe dinámico para descargas unificadas en Sidebar
 df_para_descargar = pd.DataFrame()
+
+# Hallazgos compartidos por el resumen ejecutivo y la pestaña de obsolescencia.
+try:
+    catalogo_obsoleto = cargar_catalogo_obsolescencia()
+    df_obsoletos = detectar_piezas_obsoletas(df_siru, catalogo_obsoleto)
+    df_obsoletos = filtrar_dataframe(df_obsoletos)
+except Exception as error:
+    st.error(f"No fue posible cargar o comparar la matriz de homologación: {error}")
+    df_obsoletos = pd.DataFrame()
+
+# --- PESTAÑA INICIAL: RESUMEN EJECUTIVO ---
+with tab_resumen:
+    st.markdown("## 📌 Resumen ejecutivo")
+    alcance = "Todos los registros" if equipo_seleccionado == "TODOS" else f"Equipo: {equipo_seleccionado}"
+    if divisional_seleccionada != "TODOS":
+        alcance = f"{divisional_seleccionada} · {alcance}"
+    if sitio_seleccionado:
+        sitios = ', '.join(sitio_seleccionado)
+        alcance = f"{sitios} · {alcance}"
+    if modelo_seleccionado != "TODOS":
+        alcance = f"{modelo_seleccionado} · {alcance}"
+    st.caption(f"{alcance}  ·  Los pronósticos de interfaces se generan bajo demanda en su pestaña.")
+
+    df_resumen_activos = filtrar_dataframe(df_siru)
+    df_resumen_puertos = filtrar_dataframe(resumen_puertos_equipo)
+    df_resumen_estatus = filtrar_dataframe(df_estatus_hardware)
+    df_resumen_ubicacion = filtrar_dataframe(df_ubicacion_equipos)
+    df_resumen_obsoletos = df_obsoletos
+
+    total_equipos = df_resumen_activos['NOMBRE_EQUIPO'].nunique()
+    total_tarjetas = df_resumen_activos[
+        df_resumen_activos['NUM_PARTE_TARJETA'].ne('')
+    ].drop_duplicates(['NOMBRE_EQUIPO', 'SLOT', 'NUM_PARTE_TARJETA']).shape[0]
+    total_subtarjetas = df_resumen_activos[
+        df_resumen_activos['NUM_PARTE_SUBTARJETA'].ne('')
+    ].drop_duplicates(['NOMBRE_EQUIPO', 'SLOT', 'SUBSLOT', 'NUM_PARTE_SUBTARJETA']).shape[0]
+    total_puertos = int(df_resumen_puertos['Total_Puertos'].sum()) if not df_resumen_puertos.empty else 0
+    puertos_ocupados = int(df_resumen_puertos['Puertos_Ocupados'].sum()) if not df_resumen_puertos.empty else 0
+    puertos_libres = int(df_resumen_puertos['Puertos_Libres'].sum()) if not df_resumen_puertos.empty else 0
+    puertos_reservados = int(df_resumen_puertos['Puertos_Reservados'].sum()) if not df_resumen_puertos.empty else 0
+    ocupacion = (puertos_ocupados / total_puertos * 100) if total_puertos else 0
+
+    sin_reemplazo = (
+        int(df_resumen_obsoletos['REEMPLAZO_SUGERIDO'].fillna('').map(str.strip).eq('').sum())
+        if not df_resumen_obsoletos.empty else 0
+    )
+    ubicaciones_pendientes = int(
+        df_resumen_ubicacion['UBICACION'].fillna('').str.strip().isin(['', 'N/A']).sum()
+    )
+    conteo_estatus = (
+        df_resumen_estatus['ESTATUS'].replace('', 'SIN ESTATUS').value_counts()
+        .rename_axis('Estatus').reset_index(name='Componentes')
+    )
+    colores_estatus = {
+        'EN SERVICIO': '#d9ead3',
+        'PLANEADO': '#fff2cc',
+        'BAJA PLANEADA': '#f4cccc',
+        'BAJA': '#f4cccc',
+    }
+
+    # Franja de indicadores principales
+    kpis = st.columns(4)
+    for columna, etiqueta, valor in zip(
+        kpis,
+        ('Equipos activos', 'Tarjetas instaladas', 'Subtarjetas instaladas', 'Piezas obsoletas'),
+        (total_equipos, total_tarjetas, total_subtarjetas, len(df_resumen_obsoletos)),
+    ):
+        with columna.container(border=True):
+            st.metric(etiqueta, f"{valor:,}")
+
+    st.markdown("### Equipos por modelo")
+    with st.container(border=True):
+        conteo_modelos = (
+            df_resumen_activos[['NOMBRE_EQUIPO', 'MODELO_EQUIPO']]
+            .drop_duplicates(subset=['NOMBRE_EQUIPO'])
+            .assign(MODELO_EQUIPO=lambda datos: datos['MODELO_EQUIPO'].fillna('').replace('', 'SIN MODELO'))
+            .groupby('MODELO_EQUIPO')['NOMBRE_EQUIPO']
+            .nunique()
+            .sort_values(ascending=False)
+            .rename('Equipos')
+            .reset_index()
+        )
+        if conteo_modelos.empty:
+            st.info("No hay equipos para mostrar con los filtros actuales.")
+        else:
+            conteo_modelos['Porcentaje'] = conteo_modelos['Equipos'] / conteo_modelos['Equipos'].sum() * 100
+            st.dataframe(
+                conteo_modelos,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    'MODELO_EQUIPO': 'Modelo de equipo',
+                    'Equipos': st.column_config.NumberColumn('Cantidad de equipos', format='%d'),
+                    'Porcentaje': st.column_config.ProgressColumn(
+                        'Proporción del inventario', format='%.1f%%', min_value=0, max_value=100
+                    ),
+                },
+            )
+
+    st.markdown("### Capacidad y ciclo de vida")
+    col_puertos, col_estatus = st.columns([1.15, 1])
+    with col_puertos:
+        with st.container(border=True):
+            st.markdown("#### 🔌 Capacidad de puertos")
+            st.metric("Ocupación", f"{ocupacion:.1f}%", help=f"{puertos_ocupados:,} ocupados de {total_puertos:,} puertos")
+            st.progress(min(max(ocupacion / 100, 0), 1))
+            metricas_puerto = st.columns(3)
+            metricas_puerto[0].metric("Ocupados", f"{puertos_ocupados:,}")
+            metricas_puerto[1].metric("Libres", f"{puertos_libres:,}")
+            metricas_puerto[2].metric("Reservados", f"{puertos_reservados:,}")
+            st.caption(f"{total_puertos:,} puertos contabilizados en el alcance seleccionado.")
+
+    with col_estatus:
+        with st.container(border=True):
+            st.markdown("#### 🚦 Estatus del hardware")
+            if conteo_estatus.empty:
+                st.info("No hay estatus disponibles para los filtros actuales.")
+            else:
+                st.dataframe(
+                    conteo_estatus.style.map(
+                        lambda valor: f"background-color: {colores_estatus.get(valor, '#f4cccc')};",
+                        subset=['Estatus'],
+                    ),
+                    hide_index=True, width="stretch",
+                )
+            st.caption("Incluye equipos, tarjetas y subtarjetas, también los registros en BAJA.")
+
+    st.markdown("### Hallazgos operativos")
+    col_obsolescencia, col_inventario = st.columns([1.15, 1])
+    with col_obsolescencia:
+        with st.container(border=True):
+            st.markdown("#### ⚠️ Obsolescencia y reemplazos")
+            if df_resumen_obsoletos.empty:
+                st.success("Sin piezas obsoletas detectadas en este alcance.")
+            else:
+                st.warning(
+                    f"{len(df_resumen_obsoletos):,} piezas obsoletas · "
+                    f"{sin_reemplazo:,} sin reemplazo indicado en la matriz."
+                )
+                st.dataframe(
+                    df_resumen_obsoletos.groupby('TIPO_COMPONENTE').size()
+                    .rename('Piezas obsoletas').reset_index(),
+                    hide_index=True, width="stretch",
+                )
+
+    with col_inventario:
+        with st.container(border=True):
+            st.markdown("#### 📍 Calidad de ubicación")
+            ubicacion_kpis = st.columns(2)
+            ubicacion_kpis[0].metric("Equipos revisados", f"{len(df_resumen_ubicacion):,}")
+            ubicacion_kpis[1].metric("Sin ubicación", f"{ubicaciones_pendientes:,}")
+            st.caption(f"🌐 {len(df_interfaces):,} interfaces L1 registradas en la fuente.")
+
+    st.markdown("### Uso de sesiones")
+    # Las sesiones se resumen con el mismo conjunto de equipos que consume la pestaña Infinitum.
+    try:
+        equipos_sesiones_resumen = df_resumen_activos[['NOMBRE_EQUIPO', 'MODELO_EQUIPO']].drop_duplicates()
+        datos_sesiones_resumen = preparar_sesiones(cargar_sesiones())
+        datos_sesiones_resumen = filtrar_sesiones_por_equipos(
+            datos_sesiones_resumen, equipos_sesiones_resumen['NOMBRE_EQUIPO'].dropna().unique().tolist()
+        )
+        datos_sesiones_resumen = agregar_modelo_equipo(datos_sesiones_resumen, equipos_sesiones_resumen)
+        sesiones_validas = datos_sesiones_resumen['SESIONES'].dropna()
+        with st.container(border=True):
+            st.markdown("#### 👥 Sesiones Infinitum")
+            sesion_kpis = st.columns(2)
+            sesion_kpis[0].metric("Interfaces con dato", f"{len(sesiones_validas):,}")
+            sesion_kpis[1].metric("Sesiones registradas", f"{int(sesiones_validas.sum()):,}")
+    except Exception as error:
+        st.info(f"No fue posible incluir las sesiones en este resumen: {error}")
+
+    # Recomendaciones basadas en hallazgos observables, con prioridades operativas.
+    st.markdown("### 🧭 Acciones sugeridas por ingeniería")
+    acciones = []
+    conteo_por_estatus = dict(zip(conteo_estatus['Estatus'], conteo_estatus['Componentes']))
+    piezas_baja = int(conteo_por_estatus.get('BAJA', 0))
+    piezas_baja_planeada = int(conteo_por_estatus.get('BAJA PLANEADA', 0))
+    piezas_planeadas = int(conteo_por_estatus.get('PLANEADO', 0))
+    sin_estatus = int(conteo_por_estatus.get('SIN ESTATUS', 0))
+
+    if not df_resumen_obsoletos.empty:
+        accion = (
+            "Prioridad alta" if sin_reemplazo else "Prioridad media"
+        )
+        detalle = f"{len(df_resumen_obsoletos):,} piezas obsoletas"
+        if sin_reemplazo:
+            detalle += f"; {sin_reemplazo:,} sin reemplazo sugerido"
+        acciones.append({
+            'Prioridad': accion,
+            'Acción recomendada': (
+                "Validar el reemplazo con arquitectura y proveedor, revisar compatibilidad de software/slots "
+                "y definir una ventana de migración con plan de reversa."
+            ),
+            'Hallazgo': detalle,
+        })
+
+    if piezas_baja:
+        acciones.append({
+            'Prioridad': 'Prioridad alta',
+            'Acción recomendada': (
+                "Conciliar estos activos dados de baja contra inventario y configuración de red; "
+                "confirmar que no tengan servicios dependientes antes de retirarlos de los registros operativos."
+            ),
+            'Hallazgo': f"{piezas_baja:,} componentes con estatus BAJA",
+        })
+    if piezas_baja_planeada:
+        acciones.append({
+            'Prioridad': 'Planificación',
+            'Acción recomendada': (
+                "Acordar fecha de retiro, equipo sustituto, dependencias y ventana de cambio; "
+                "mantener seguimiento hasta completar la baja."
+            ),
+            'Hallazgo': f"{piezas_baja_planeada:,} componentes con baja planeada",
+        })
+    if piezas_planeadas:
+        acciones.append({
+            'Prioridad': 'Planificación',
+            'Acción recomendada': (
+                "Confirmar alcance, responsable, disponibilidad y criterios de aceptación; "
+                "actualizar el estatus cuando la instalación y validación queden concluidas."
+            ),
+            'Hallazgo': f"{piezas_planeadas:,} componentes planeados",
+        })
+
+    if not df_resumen_puertos.empty:
+        capacidad_equipo = df_resumen_puertos.copy()
+        capacidad_equipo['OCUPACION_PCT'] = (
+            capacidad_equipo['Puertos_Ocupados']
+            / capacidad_equipo['Total_Puertos'].replace(0, pd.NA)
+            * 100
+        )
+        equipos_criticos = capacidad_equipo[capacidad_equipo['OCUPACION_PCT'] >= 95]
+        equipos_alta_ocupacion = capacidad_equipo[
+            (capacidad_equipo['OCUPACION_PCT'] >= 85)
+            & (capacidad_equipo['OCUPACION_PCT'] < 95)
+        ]
+        if not equipos_criticos.empty:
+            ejemplos = ', '.join(
+                f"{fila.NOMBRE_EQUIPO} ({fila.OCUPACION_PCT:.0f}%)"
+                for fila in equipos_criticos.nlargest(5, 'OCUPACION_PCT').itertuples()
+            )
+            acciones.append({
+                'Prioridad': 'Prioridad alta',
+                'Acción recomendada': (
+                    "Revisar capacidad de inmediato: identificar puertos recuperables, validar crecimiento "
+                    "de demanda y preparar expansión o redistribución antes de nuevas conexiones."
+                ),
+                'Hallazgo': f"{len(equipos_criticos):,} equipos con ocupación ≥95%: {ejemplos}",
+            })
+        elif not equipos_alta_ocupacion.empty:
+            ejemplos = ', '.join(
+                f"{fila.NOMBRE_EQUIPO} ({fila.OCUPACION_PCT:.0f}%)"
+                for fila in equipos_alta_ocupacion.nlargest(5, 'OCUPACION_PCT').itertuples()
+            )
+            acciones.append({
+                'Prioridad': 'Monitoreo',
+                'Acción recomendada': (
+                    "Incluir estos equipos en el pronóstico de capacidad y revisar mensualmente "
+                    "la tendencia de crecimiento para anticipar ampliaciones."
+                ),
+                'Hallazgo': f"{len(equipos_alta_ocupacion):,} equipos entre 85% y 95%: {ejemplos}",
+            })
+
+    if ubicaciones_pendientes:
+        acciones.append({
+            'Prioridad': 'Calidad de datos',
+            'Acción recomendada': (
+                "Completar sitio y ubicación física (sala, fila y posición) en SIRU; "
+                "esto facilita atención de incidentes, cambios y validaciones en campo."
+            ),
+            'Hallazgo': f"{ubicaciones_pendientes:,} equipos sin ubicación capturada",
+        })
+    if sin_estatus:
+        acciones.append({
+            'Prioridad': 'Calidad de datos',
+            'Acción recomendada': "Completar y normalizar el estatus de los componentes para que los reportes de ciclo de vida sean confiables.",
+            'Hallazgo': f"{sin_estatus:,} componentes sin estatus",
+        })
+
+    with st.container(border=True):
+        if acciones:
+            prioridad_orden = {'Prioridad alta': 0, 'Planificación': 1, 'Monitoreo': 2, 'Calidad de datos': 3, 'Prioridad media': 4}
+            acciones.sort(key=lambda accion: prioridad_orden.get(accion['Prioridad'], 5))
+            st.dataframe(
+                pd.DataFrame(acciones),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    'Prioridad': st.column_config.TextColumn('Prioridad', width='small'),
+                    'Acción recomendada': st.column_config.TextColumn('Acción recomendada', width='large'),
+                    'Hallazgo': st.column_config.TextColumn('Dato que la sustenta', width='medium'),
+                },
+            )
+        else:
+            st.success(
+                "No hay alertas que requieran una acción inmediata en este alcance. "
+                "Mantén la revisión periódica de capacidad, obsolescencia, estados y calidad del inventario."
+            )
 
 # --- PESTAÑA 1: HARDWARE ---
 with tab1:
@@ -486,25 +867,37 @@ with tab4:
         from dar import pronosticos
         import pandas as pd
 
-        engine_prophet = crear_engine_mysql()
-
         # 2. Extracción dinámica de hostnames basados en el equipo PERCENTIL_HISTORICO actual
-        with st.spinner("Buscando interfaces indexadas en telemetría..."):
-            query_buscar_hosts = """
-                                 SELECT DISTINCT interface_hostname
-                                 FROM PERCENTIL_HISTORICO
-                                 WHERE interface_hostname LIKE %s
-                                    OR interface_hostname = %s
-                                 ORDER BY interface_hostname; \
-                                 """
-            patron_busqueda = f"%{equipo_seleccionado}%"
-            df_hosts_disponibles = pd.read_sql(
-                query_buscar_hosts,
-                engine_prophet,
-                params=(patron_busqueda, equipo_seleccionado)
-            )
+        try:
+            with st.spinner("Buscando interfaces indexadas en telemetría..."):
+                engine_prophet = crear_engine_mysql()
+                query_buscar_hosts = """
+                                     SELECT DISTINCT interface_hostname
+                                     FROM PERCENTIL_HISTORICO
+                                     WHERE interface_hostname LIKE %s
+                                        OR interface_hostname = %s
+                                     ORDER BY interface_hostname; \
+                                     """
+                patron_busqueda = f"%{equipo_seleccionado}%"
+                df_hosts_disponibles = pd.read_sql(
+                    query_buscar_hosts,
+                    engine_prophet,
+                    params=(patron_busqueda, equipo_seleccionado)
+                )
+            error_telemetria = None
+        except Exception as error:
+            df_hosts_disponibles = pd.DataFrame()
+            error_telemetria = error
 
-        if df_hosts_disponibles.empty:
+        if error_telemetria:
+            if "1146" in str(error_telemetria) or "doesn't exist" in str(error_telemetria):
+                st.warning(
+                    "La tabla `PERCENTIL_HISTORICO` no existe en la base de datos configurada. "
+                    "La pestaña de pronósticos estará disponible cuando se cree y alimente esa tabla."
+                )
+            else:
+                st.error(f"No fue posible consultar la telemetría histórica: {error_telemetria}")
+        elif df_hosts_disponibles.empty:
             st.error(
                 f"❌ No se localizaron registros de tráfico históricos en `PERCENTIL_HISTORICO` para el equipo **{equipo_seleccionado}**.")
         else:
@@ -712,6 +1105,82 @@ with tab7:
         'NUM_PARTE_SUBTARJETA',
     ]].drop_duplicates()
     mostrar_sesiones(equipos_sesiones)
+
+with tab8:
+    st.subheader("Piezas obsoletas y reemplazos de la matriz UniNet")
+    st.caption(
+        "Cruce exacto de números de parte de chasis, tarjetas y subtarjetas contra las filas "
+        "marcadas como OBSOLETO en la matriz."
+    )
+    if buscar_ip_vlan:
+        st.caption("El buscador de IP/VLAN no aplica a este reporte de hardware.")
+    if df_obsoletos.empty:
+        st.info("No se encontraron piezas obsoletas instaladas con los filtros actuales.")
+    else:
+        reemplazos_vacios = df_obsoletos["REEMPLAZO_SUGERIDO"].fillna("").map(str.strip).eq("")
+        kpi_obsoletos, kpi_partes, kpi_sin_reemplazo = st.columns(3)
+        kpi_obsoletos.metric("Piezas instaladas obsoletas", f"{len(df_obsoletos):,}")
+        kpi_partes.metric("Números de parte", f"{df_obsoletos['NUM_PARTE_INSTALADA'].nunique():,}")
+        kpi_sin_reemplazo.metric("Sin reemplazo indicado", f"{int(reemplazos_vacios.sum()):,}")
+
+        df_vista_obsoletos = df_obsoletos.copy()
+        df_vista_obsoletos["REEMPLAZO_SUGERIDO"] = (
+            df_vista_obsoletos["REEMPLAZO_SUGERIDO"].fillna("").replace("", "Sin reemplazo indicado")
+        )
+        columnas_obsoletos = [
+            "DIVISIONAL", "SITIO_UNINET", "NOMBRE_EQUIPO", "MODELO_EQUIPO", "CHASIS",
+            "TIPO_COMPONENTE", "SLOT", "SUBSLOT", "NUM_PARTE_INSTALADA",
+            "PROVEEDOR_MATRIZ", "MODELO_MATRIZ", "TIPO_PIEZA_MATRIZ",
+            "REEMPLAZO_SUGERIDO", "DESCRIPCION_MATRIZ", "HOJA_MATRIZ",
+        ]
+        st.dataframe(
+            df_vista_obsoletos[columnas_obsoletos],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "TIPO_COMPONENTE": "Componente instalado",
+                "NUM_PARTE_INSTALADA": "Número de parte instalado",
+                "REEMPLAZO_SUGERIDO": "Reemplazo según matriz",
+                "DESCRIPCION_MATRIZ": "Descripción en matriz",
+                "HOJA_MATRIZ": "Hoja de origen",
+            },
+        )
+        st.download_button(
+            "Descargar reporte de obsolescencia (.csv)",
+            data=df_vista_obsoletos[columnas_obsoletos].to_csv(index=False).encode("utf-8-sig"),
+            file_name="reporte_hardware_obsoleto.csv",
+            mime="text/csv",
+        )
+
+with tab9:
+    st.subheader("Estatus de equipos, tarjetas y subt tarjetas")
+    st.caption(
+        "Los equipos en BAJA también se incluyen en esta vista. Verde: EN SERVICIO; "
+        "amarillo: PLANEADO; rojo: BAJA PLANEADA o BAJA."
+    )
+    df_tab9 = filtrar_dataframe(df_estatus_hardware)
+    if buscar_ip_vlan:
+        st.caption("El buscador de IP/VLAN no aplica a este reporte de hardware.")
+    if df_tab9.empty:
+        st.info("No se encontraron componentes con los filtros actuales.")
+    else:
+        def estilo_estatus(valor):
+            if valor == "EN SERVICIO":
+                return "background-color: #d9ead3;"
+            if valor == "PLANEADO":
+                return "background-color: #fff2cc;"
+            return "background-color: #f4cccc;"
+
+        st.dataframe(
+            df_tab9.style.map(estilo_estatus, subset=["ESTATUS"]),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "TIPO_COMPONENTE": "Componente",
+                "NUM_PARTE": "Número de parte",
+                "ESTATUS": "Estatus",
+            },
+        )
 
 
 # =====================================================================

@@ -2,22 +2,25 @@
 
 Proyecto en Python para consultar inventario de infraestructura de red en MySQL, visualizarlo con Streamlit, guardar históricos de interfaces y estimar su ocupación futura con Prophet.
 
-El punto de entrada principal es `app.py`. Los dashboards consultan datos existentes; la carga del inventario y de las mediciones debe realizarse mediante un proceso externo. El proyecto incluye el esquema SQL, pero no datos de ejemplo ni un importador.
+El punto de entrada principal es `app.py`. Los dashboards consultan datos existentes; la carga del inventario y de las mediciones debe realizarse mediante un proceso externo. El proyecto incluye el esquema SQL y la matriz de obsolescencia de referencia, pero no datos de inventario de ejemplo ni un importador.
 
 ## Estructura del proyecto
 
 | Archivo | Función |
 | --- | --- |
 | `app.py` | Dashboard principal con inventario, capacidad, interfaces L1, ubicación y conciliación. |
-| `pages/1_inventario.py` | Dashboard independiente de tarjetas y subtarjetas, con filtros por sitio, modelo de equipo y equipo. |
 | `jobs/snapshot.py` | Copia el estado de interfaces activas a la tabla histórica. |
 | `src/dar/pronosticos.py` | Funciones de pronóstico con Prophet usadas por el dashboard. |
+| `src/dar/obsolescencia.py` | Cruza números de parte del inventario con las piezas obsoletas y reemplazos de la matriz. |
+| `data/reference/matriz_elementos_homologados_uninet.xlsx` | Catálogo de homologación usado por el reporte de obsolescencia. |
 | `main.py` | Plantilla de PyCharm: imprime un saludo; no inicia la aplicación. |
 | `docker-compose.yml` | Servicio MySQL y volumen persistente. No contiene un servicio para Streamlit. |
 | `sql/init/DatabaseSchemaManagement.sql` | Creación de la base de datos, tablas e índices. |
 | `src/dar/` | Paquete con conexiones, consultas, gráficas, sesiones, transformaciones y vistas reutilizables. |
 | `.env.example` | Plantilla para crear el archivo local `.env`. |
 | `requirements.txt` | Dependencias de los dashboards y del snapshot, incluido Prophet. |
+
+El dashboard requiere `openpyxl` para leer la matriz Excel; queda instalado junto con las dependencias del proyecto.
 
 ## Requisitos e instalación
 
@@ -40,7 +43,7 @@ En Windows, activar el entorno con `.venv\Scripts\activate` desde CMD o `.venv\S
 
 ## Configuración de MySQL
 
-Los puntos de entrada (`app.py`, `pages/1_inventario.py` y `jobs/snapshot.py`) usan el paquete `src/dar`. Su módulo de configuración carga `.env` desde la raíz del proyecto, independientemente del directorio desde el que se ejecute Python.
+Los puntos de entrada (`app.py` y `jobs/snapshot.py`) usan el paquete `src/dar`. Su módulo de configuración carga `.env` desde la raíz del proyecto, independientemente del directorio desde el que se ejecute Python.
 
 Si todavía no existe un archivo `.env`, crearlo desde la plantilla:
 
@@ -129,11 +132,14 @@ Ambos dashboards utilizan Plotly para las gráficas de los diez números de part
 
 El botón **Limpiar filtros** de la barra lateral restablece divisional, sitio, modelo y equipo a `TODOS`, vacía la búsqueda por IP/VLAN y restablece el filtro de tipo de asignación del detalle de ocupados.
 
-La barra lateral permite filtrar en cascada por divisional, sitio Uninet, modelo de equipo y nombre de equipo. El modelo corresponde a `MODELO` de `SIRU_DSL` (alias `MODELO_EQUIPO`); sus opciones dependen del sitio y divisional seleccionados, y restringen la lista de equipos. La opción `TODOS` permite incluir todos los modelos. Este filtro se aplica a las cinco pestañas y a la conciliación exportada; en L1 se conserva la relación por slots descrita más adelante. El buscador por IP o VLAN se aplica a las vistas de interfaces y conciliación que contienen esos campos.
+La barra lateral permite filtrar en cascada por divisional, uno o varios sitios Uninet, modelo de equipo y nombre de equipo. Si no se selecciona ningún sitio, se incluyen todos los sitios disponibles para la divisional elegida. El modelo corresponde a `MODELO` de `SIRU_DSL` (alias `MODELO_EQUIPO`); sus opciones dependen de la divisional y sitios seleccionados, y restringen la lista de equipos. La opción `TODOS` permite incluir todos los modelos y equipos. Los filtros se aplican a las vistas que contienen esos campos y a la conciliación; en L1 se conserva la relación por slots descrita más adelante. El buscador por IP o VLAN se aplica a las vistas de interfaces y conciliación que contienen esos campos.
 
 | Pestaña | Información presentada |
 | --- | --- |
+| Resumen ejecutivo | Indicadores de inventario, equipos por modelo, capacidad de puertos, estados de hardware, obsolescencia, calidad de ubicación y sesiones, con acciones sugeridas a partir de los hallazgos. Es la pestaña inicial. |
 | Números de Parte de Hardware | Matriz de tarjetas y subtarjetas, con los diez números de parte predominantes según el filtro. |
+| Estatus de hardware | Equipos/chasis, tarjetas y subtarjetas clasificados como `EN SERVICIO`, `PLANEADO`, `BAJA PLANEADA` o `BAJA`, incluyendo bajas y con colores por estado. |
+| Obsolescencia y reemplazos | Tarjetas y subtarjetas instaladas que la matriz marca como obsoletas, sus reemplazos sugeridos y la hoja de origen; incluye exportación CSV. |
 | Capacidad y Estado de Puertos | Conteos de puertos ocupados, libres y reservados, y ocupación por equipo. |
 | Interfaces Capa 1 (L1) | Interfaces de los slots seleccionados, IP, VLAN, protocolo, ancho de banda y estado administrativo. |
 | Ubicación y Datos Maestros | Una fila por nombre de equipo con piso, sala, fila, elemento de fila, patch panel y atributos de gestión. |
@@ -141,7 +147,17 @@ La barra lateral permite filtrar en cascada por divisional, sitio Uninet, modelo
 
 En **Capacidad y Estado de Puertos**, los botones **Ver puertos ocupados**, **Ver puertos libres** y **Ver puertos reservados**, debajo de cada contador, abren un popup con el detalle correspondiente. Incluyen equipo, modelo, chasis, slot, subslot, puerto, tipo de asignación, números de parte, descripción y posiciones de remate (piso, sala, fila, elemento de fila, patch panel y `POS_REMATE`), en lugar de ubicación. El detalle respeta los filtros de divisional, sitio, modelo y equipo, y utiliza la misma clasificación que los contadores. Cada botón queda deshabilitado cuando su contador es cero. El popup de ocupados incluye un desglose de cantidades por `TIPO_ASIG` y un selector para consultar los puertos de cada tipo; el desglose conserva los totales de los filtros del dashboard.
 
+El **Resumen ejecutivo** respeta los filtros actuales y presenta el inventario por modelo y componente, utilización de puertos, ciclo de vida, piezas obsoletas, calidad de ubicación e indicadores de sesiones Infinitum. La sección **Acciones sugeridas por ingeniería** prioriza los hallazgos con reglas explícitas: piezas obsoletas (especialmente las que no tienen reemplazo), hardware dado de baja o planeado, equipos con ocupación de puertos desde 85% y datos de ubicación o estatus faltantes. El umbral de 95% se marca como prioridad alta. Son recomendaciones operativas basadas en los datos del inventario, no cambios automáticos a la red. Los pronósticos de capacidad continúan siendo una consulta bajo demanda en la pestaña de interfaces.
+
 El botón lateral exporta la conciliación filtrada como `conciliacion_siru_vs_l1.csv`, en UTF-8 y sin índice. Solo aparece si esa vista contiene filas; no exporta todas las pestañas.
+
+La pestaña **Obsolescencia y reemplazos** aplica los filtros de divisional, sitio, modelo y equipo al comparar números de parte de chasis, tarjetas y subtarjetas con filas marcadas explícitamente como `OBSOLETO` en la matriz de referencia. Muestra los reemplazos sugeridos cuando la fuente los especifica; si la matriz no ofrece uno, lo identifica como **Sin reemplazo indicado**. La comparación normaliza mayúsculas y espacios y busca coincidencias exactas de número de parte. Para actualizar el catálogo, reemplaza `data/reference/matriz_elementos_homologados_uninet.xlsx`; el dashboard detecta el cambio de archivo y recarga la matriz.
+
+#### Actualizar la matriz de elementos
+
+1. Reemplaza `data/reference/matriz_elementos_homologados_uninet.xlsx` con la versión actualizada, conservando ese nombre y la estructura de hojas/columnas que contiene estatus, número de parte y reemplazo.
+2. El dashboard detecta el cambio de archivo y vuelve a leer la matriz en la siguiente ejecución de Streamlit. Si la página no se refresca, recárgala o reinicia la aplicación.
+3. Guarda el archivo actualizado en Git para que otros entornos reciban la nueva matriz; en un despliegue, incluye el archivo en la siguiente publicación.
 
 ### Criterios de cálculo y alcance
 
@@ -153,20 +169,6 @@ El botón lateral exporta la conciliación filtrada como `conciliacion_siru_vs_l
 - Se genera alerta cuando hay asignaciones y `SHUTDOWN = 1`, o cuando no hay asignaciones y existe una IP. Las demás coincidencias se etiquetan como alineadas; esa etiqueta no valida todos los atributos del enlace.
 - El indicador de interfaces activas del dashboard usa `SHUTDOWN = 0`, no una comprobación del estado operativo `STATUS`.
 - El buscador utiliza `str.contains` con expresiones regulares activadas: los puntos de una IP y otros caracteres especiales no se interpretan necesariamente como texto literal.
-
-## Dashboard de inventario independiente
-
-```bash
-python -m streamlit run pages/1_inventario.py
-```
-
-Para ejecutarlo junto al dashboard principal:
-
-```bash
-python -m streamlit run pages/1_inventario.py --server.port 8502
-```
-
-Muestra tarjetas y subtarjetas por equipo, slot y subslot. Los filtros por sitio, modelo de equipo y equipo afectan a la tabla; sus indicadores generales y gráficas de los diez modelos predominantes se calculan sobre el inventario completo. Los equipos sin número de parte de tarjeta no forman parte de esa matriz.
 
 ## Captura de histórico
 

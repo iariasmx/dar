@@ -43,3 +43,4 @@ uvicorn
 watchdog
 websockets
 prophet
+openpyxl

@@ -89,7 +89,10 @@ def generar_matriz_conectividad(df_siru, df_equipos, df_interfaces, divisional="
     if divisional != "TODOS":
         matriz = matriz[matriz['DIVISIONAL'] == divisional]
 
-    if sitio != "TODOS":
+    if isinstance(sitio, (list, tuple, set)):
+        if sitio:
+            matriz = matriz[matriz['SITIO_UNINET'].isin(sitio)]
+    elif sitio != "TODOS":
         matriz = matriz[matriz['SITIO_UNINET'] == sitio]
 
     if modelo != "TODOS":

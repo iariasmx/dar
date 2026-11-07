@@ -36,7 +36,10 @@ def _aplicar_filtros(datos, divisional, sitio, modelo, equipo):
     }
     resultado = datos.copy()
     for columna, valor in filtros.items():
-        if valor and valor != "TODOS":
+        if columna == "SITIO_UNINET" and isinstance(valor, (list, tuple, set)):
+            if valor:
+                resultado = resultado[resultado[columna].isin(valor)]
+        elif valor and valor != "TODOS":
             resultado = resultado[resultado[columna] == valor]
     return resultado
 
